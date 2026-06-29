@@ -2515,8 +2515,9 @@ function mergeCursorDiscoveredModels(primaryModels, additionalModels) {
   const seen = new Set();
   const merged = [];
   for (const model of [...normalizeModelList(primaryModels), ...normalizeModelList(additionalModels)]) {
-    if (seen.has(model.id)) continue;
-    seen.add(model.id);
+    const key = model.id.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
     merged.push(model);
   }
   return merged;
