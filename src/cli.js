@@ -1759,16 +1759,6 @@ function cursorToolKind(toolCall) {
   return CURSOR_COPILOT_TOOL_KINDS.has(kind) ? kind : "tool";
 }
 
-function cursorToolItemIds(toolCall) {
-  const ids = normalizeToolCallIds({
-    id: `cursor_${safeToolIdentifier(toolCall?.id || randomUUID(), "tool")}`,
-  });
-  return {
-    itemId: ids.itemId,
-    callId: ids.callId,
-  };
-}
-
 function cursorToolName(toolCall) {
   return `subbridge_cursor_${cursorToolKind(toolCall)}`;
 }
@@ -1784,6 +1774,21 @@ function cursorToolArguments(toolCall) {
     ...(toolCall.data?.rawOutput !== undefined ? { output: toolCall.data.rawOutput } : {}),
     ...(toolCall.data?.locations !== undefined ? { locations: toolCall.data.locations } : {}),
   });
+}
+
+function truncateOneLine(value, maxLength = 240) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function cursorToolSummaryLine(toolCall) {
+  const status = toolCall?.status || "in_progress";
+  const kind = toolCall?.kind || "tool";
+  const title = toolCall?.title || cursorToolName(toolCall);
+  const detail = toolCall?.command || toolCall?.detail || "";
+  const suffix = detail ? ` - ${truncateOneLine(detail)}` : "";
+  return `[cursor:${kind}:${status}] ${truncateOneLine(title, 120)}${suffix}\n`;
 }
 
 function mergeCursorToolCallState(previous, next) {
@@ -1825,20 +1830,12 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       const existing = tools.get(event.toolCall.id);
       const toolCall = mergeCursorToolCallState(existing?.toolCall, event.toolCall);
       logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
-      const ids = cursorToolItemIds(toolCall);
-      const item = existing?.item || {
-        id: ids.itemId,
-        type: "function_call",
-        call_id: ids.callId,
-        name: cursorToolName(toolCall),
-        arguments: "",
-        status: "in_progress",
-      };
-      item.name = cursorToolName(toolCall);
-      item.arguments = cursorToolArguments(toolCall);
-      if (cursorToolStatusIsTerminal(toolCall.status)) item.status = "completed";
-      tools.set(toolCall.id, { item, toolCall });
+      tools.set(toolCall.id, { toolCall });
     }
+  }
+
+  for (const entry of tools.values()) {
+    reasoningText += cursorToolSummaryLine(entry.toolCall);
   }
 
   if (reasoningText) {
@@ -1849,7 +1846,6 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       summary: [{ type: "summary_text", text: reasoningText }],
     });
   }
-  output.push(...Array.from(tools.values()).map((entry) => entry.item));
   const finalText = assistantText || fallbackText;
   if (finalText) {
     output.push({
@@ -2052,62 +2048,43 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     reasoningEntry = null;
   };
 
+  const appendReasoningText = (text) => {
+    const entry = ensureReasoningEntry();
+    entry.text += text;
+    entry.part.text = entry.text;
+    recordWrite("response.reasoning_summary_text.delta", {
+      item_id: entry.item.id,
+      output_index: entry.outputIndex,
+      summary_index: 0,
+      delta: text,
+    });
+  };
+
   const applyToolCallEvent = (eventToolCall) => {
     finishAssistantEntry();
-    finishReasoningEntry();
     const existingEntry = toolEntries.get(eventToolCall.id);
     const toolCall = mergeCursorToolCallState(existingEntry?.toolCall, eventToolCall);
     logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
-    const ids = cursorToolItemIds(toolCall);
-    const name = cursorToolName(toolCall);
-    const args = cursorToolArguments(toolCall);
-    let entry = existingEntry;
-    if (!entry) {
-      const item = {
-        id: ids.itemId,
-        type: "function_call",
-        call_id: ids.callId,
-        name,
-        arguments: "",
-        status: "in_progress",
-      };
-      const outputIndex = addOutputItem(item);
-      entry = { item, outputIndex, argumentsWritten: false, toolCall };
-      toolEntries.set(toolCall.id, entry);
-      recordWrite("response.function_call_arguments.delta", {
-        item_id: item.id,
-        output_index: outputIndex,
-        delta: args,
-      });
-      entry.argumentsWritten = true;
-    }
+    let entry = existingEntry || { toolCall, startReported: false, terminalReported: false };
     entry.toolCall = toolCall;
-    entry.item.name = name;
-    entry.item.arguments = args;
-    if (cursorToolStatusIsTerminal(toolCall.status) && entry.item.status !== "completed") {
-      entry.item.status = "completed";
-      recordWrite("response.function_call_arguments.done", {
-        item_id: entry.item.id,
-        output_index: entry.outputIndex,
-        name,
-        arguments: args,
-      });
-      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    if (!existingEntry) toolEntries.set(toolCall.id, entry);
+    if (!entry.startReported && !cursorToolStatusIsTerminal(toolCall.status)) {
+      appendReasoningText(cursorToolSummaryLine(toolCall));
+      entry.startReported = true;
+    }
+    if (cursorToolStatusIsTerminal(toolCall.status) && !entry.terminalReported) {
+      appendReasoningText(cursorToolSummaryLine(toolCall));
+      entry.terminalReported = true;
     }
   };
 
   const finishOpenToolEntries = () => {
     for (const entry of toolEntries.values()) {
-      if (entry.item.status === "completed") continue;
-      entry.item.status = "completed";
-      recordWrite("response.function_call_arguments.done", {
-        item_id: entry.item.id,
-        output_index: entry.outputIndex,
-        name: entry.item.name,
-        arguments: entry.item.arguments,
-      });
-      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+      if (entry.terminalReported) continue;
+      appendReasoningText(cursorToolSummaryLine(entry.toolCall));
+      entry.terminalReported = true;
     }
+    toolEntries.clear();
   };
 
   const applyCursorEvent = (event) => {
@@ -2124,15 +2101,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       return;
     }
     if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
-      const entry = ensureReasoningEntry();
-      entry.text += event.text;
-      entry.part.text = entry.text;
-      recordWrite("response.reasoning_summary_text.delta", {
-        item_id: entry.item.id,
-        output_index: entry.outputIndex,
-        summary_index: 0,
-        delta: event.text,
-      });
+      appendReasoningText(event.text);
       return;
     }
     if (event.type === "tool_call") {

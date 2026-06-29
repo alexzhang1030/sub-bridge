@@ -866,12 +866,11 @@ test("cursor bridge streams reasoning and assistant Responses events", async () 
     const types = parseSseTypes(text);
     assert.ok(types.includes("response.reasoning_summary_text.delta"));
     assert.ok(types.includes("response.output_item.added"));
-    assert.ok(types.includes("response.function_call_arguments.delta"));
-    assert.ok(types.includes("response.function_call_arguments.done"));
     assert.ok(types.includes("response.output_text.delta"));
     assert.ok(types.includes("response.completed"));
-    assert.ok(text.includes('"name":"subbridge_cursor_execute"'));
-    assert.ok(text.includes('\\"command\\":\\"echo pong\\"'));
+    assert.equal(types.includes("response.function_call_arguments.delta"), false);
+    assert.equal(types.includes("response.function_call_arguments.done"), false);
+    assert.ok(text.includes("[cursor:execute:pending] Ran command - echo pong"));
     assert.equal(text.includes('"name":"cursor_tool"'), false);
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");

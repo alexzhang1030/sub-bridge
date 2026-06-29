@@ -176,14 +176,51 @@ load_launch_agent() {
     return
   fi
 
+  port="$("$install_bin" --sub "$sub" config get port 2>/dev/null | tr -d '"[:space:]' || true)"
+
+  wait_for_port_release() {
+    if [ -z "$port" ] || ! command -v lsof >/dev/null 2>&1; then
+      sleep 2
+      return
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        return
+      fi
+      sleep 0.25
+    done
+  }
+
   launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
-  if launchctl bootstrap "gui/$uid" "$plist_path" >/dev/null 2>&1; then
-    launchctl kickstart -k "gui/$uid/$label" >/dev/null 2>&1 || true
-    echo "launchctl loaded: $label"
-  else
-    echo "launchctl load skipped for $label"
-    echo "manual load: launchctl bootstrap gui/$uid $plist_path"
-  fi
+  wait_for_port_release
+
+  load_output=""
+  for attempt in 1 2 3; do
+    if load_output="$(launchctl bootstrap "gui/$uid" "$plist_path" 2>&1)"; then
+      sleep 0.5
+      if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+        echo "launchctl loaded: $label"
+        return
+      fi
+      load_output="service disappeared after bootstrap"
+    fi
+
+    if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+      launchctl kickstart -k "gui/$uid/$label" >/dev/null 2>&1 || true
+      echo "launchctl loaded: $label"
+      return
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      sleep 0.5
+      launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+      wait_for_port_release
+    fi
+  done
+
+  echo "launchctl load failed for $label" >&2
+  printf '%s\n' "$load_output" >&2
+  return 1
 }
 
 mkdir -p "$bin_dir"
