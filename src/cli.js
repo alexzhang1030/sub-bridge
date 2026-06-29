@@ -14,6 +14,7 @@ import { homedir, platform, release, arch } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { cursorAbout, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -65,6 +66,7 @@ const COPILOT_DB =
 const HOST = configValue("host", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"], "127.0.0.1");
 const PORT = configNumber("port", ["SUB_BRIDGE_PORT", "CODEXSUB_PORT"], 17876);
 const DEFAULT_MODEL = configValue("model", ["SUB_BRIDGE_MODEL", "CODEXSUB_MODEL"], "gpt-5.5");
+const BACKEND = configValue("backend", ["SUB_BRIDGE_BACKEND"], "codex");
 const BRIDGE_KEY = configValue("bridgeKey", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"], "");
 const ORIGINATOR = configValue("originator", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB_ORIGINATOR"], "pi");
 const PROVIDER_ID = configValue(
@@ -111,6 +113,23 @@ const STRIP_TOOLS_SETTING = String(
 const STRIP_COPILOT_TOOLS = !["0", "false", "no", "off"].includes(STRIP_TOOLS_SETTING);
 const BASE_URL = `http://${HOST}:${PORT}/v1`;
 const HEALTH_URL = `http://${HOST}:${PORT}/healthz`;
+const CURSOR_ACP_COMMAND = configValue(
+  "cursorAcpCommand",
+  ["SUB_BRIDGE_CURSOR_ACP_COMMAND"],
+  "agent",
+);
+const CURSOR_API_ENDPOINT = configValue("cursorApiEndpoint", ["SUB_BRIDGE_CURSOR_API_ENDPOINT"], "");
+const CURSOR_WORKSPACE = configValue("cursorWorkspace", ["SUB_BRIDGE_CURSOR_WORKSPACE"], process.cwd());
+const CURSOR_MODEL = configValue("cursorModel", ["SUB_BRIDGE_CURSOR_MODEL"], "default");
+const CURSOR_ACP_TIMEOUT_MS = configNumber(
+  "cursorAcpTimeoutMs",
+  ["SUB_BRIDGE_CURSOR_ACP_TIMEOUT_MS"],
+  600000,
+);
+const CURSOR_FORCE_CI_SETTING = String(
+  configValue("cursorForceCi", ["SUB_BRIDGE_CURSOR_FORCE_CI"], "1"),
+).toLowerCase();
+const CURSOR_FORCE_CI = !["0", "false", "no", "off"].includes(CURSOR_FORCE_CI_SETTING);
 let piRuntimePromise = null;
 
 function logLine(message, fields = {}) {
@@ -170,6 +189,7 @@ Environment:
   SUB_BRIDGE_PORT=17876
   SUB_BRIDGE_HOST=127.0.0.1
   SUB_BRIDGE_MODEL=gpt-5.5
+  SUB_BRIDGE_BACKEND=codex|cursor-acp
   SUB_BRIDGE_AUTH_PATH=${AUTH_PATH}
   SUB_BRIDGE_KEY=optional-local-key
   SUB_BRIDGE_COPILOT_DB=${COPILOT_DB}
@@ -179,6 +199,9 @@ Environment:
   SUB_BRIDGE_USE_PI=1
   SUB_BRIDGE_PI_DIR=${PI_RUNTIME_DIR}
   SUB_BRIDGE_PI_TRANSPORT=auto
+  SUB_BRIDGE_CURSOR_ACP_COMMAND=${CURSOR_ACP_COMMAND}
+  SUB_BRIDGE_CURSOR_WORKSPACE=${CURSOR_WORKSPACE}
+  SUB_BRIDGE_CURSOR_MODEL=${CURSOR_MODEL}
 `);
   process.exit(exitCode);
 }
@@ -1201,7 +1224,202 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
   upstreamStream.pipe(res);
 }
 
+async function forwardResponsesCursorAcp(req, res, bodyText) {
+  const startedAt = Date.now();
+  const normalized = normalizeRequestBody(bodyText);
+  const body = JSON.parse(normalized.body);
+  const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
+  const output = [];
+  const actualCursorModel = CURSOR_MODEL === "request" ? body.model : CURSOR_MODEL;
+
+  logLine("responses.forward", {
+    path: req.url,
+    model: body.model,
+    cursorModel: actualCursorModel,
+    stream: body.stream,
+    inputType: normalized.info.inputType,
+    toolsIn: normalized.info.toolsIn,
+    toolsOut: 0,
+    strippedTools: normalized.info.strippedTools,
+    strippedParams: normalized.info.strippedParams,
+    reasoningEffort: REASONING_EFFORT,
+    runtime: "cursor-acp",
+    command: CURSOR_ACP_COMMAND,
+    workspace: CURSOR_WORKSPACE,
+  });
+
+  const runOptionsBase = {
+    command: CURSOR_ACP_COMMAND,
+    apiEndpoint: CURSOR_API_ENDPOINT || undefined,
+    workspace: CURSOR_WORKSPACE,
+    env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+    timeoutMs: CURSOR_ACP_TIMEOUT_MS,
+    model: actualCursorModel,
+    reasoningEffort: REASONING_EFFORT,
+    body,
+    onStderr: (chunk) => {
+      const text = String(chunk || "").trim();
+      if (text) logLine("cursor.stderr", { text: logPrefix(text, 500) });
+    },
+    onProtocolError: (error) => {
+      logLine("cursor.protocol_error", { message: error instanceof Error ? error.message : String(error) });
+    },
+  };
+
+  if (body.stream === false) {
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+    const result = await runCursorAcpTurn({ ...runOptionsBase, signal: controller.signal });
+    const item = {
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: result.text, annotations: [] }],
+    };
+    output.push(item);
+    json(res, 200, responseObject({
+      id: responseId,
+      model: body.model,
+      status: "completed",
+      output,
+      usage: result.usage,
+    }));
+    logLine("responses.complete", {
+      status: 200,
+      model: body.model,
+      cursorModel: actualCursorModel,
+      responseFormat: "json",
+      totalMs: Date.now() - startedAt,
+      runtime: "cursor-acp",
+      stopReason: result.stopReason,
+    });
+    return;
+  }
+
+  res.statusCode = 200;
+  res.setHeader("content-type", "text/event-stream; charset=utf-8");
+  res.setHeader("cache-control", "no-cache");
+  res.setHeader("connection", "keep-alive");
+  res.setHeader("x-sub-bridge-runtime", "cursor-acp");
+  res.setHeader("x-sub-bridge-cursor-model", actualCursorModel);
+
+  let bytes = 0;
+  const recordWrite = (event, data) => {
+    const before = res.writableLength;
+    sseWrite(res, event, data);
+    bytes += Math.max(0, res.writableLength - before);
+  };
+
+  const outputIndex = 0;
+  const itemId = `msg_${randomUUID().replace(/-/g, "")}`;
+  const item = {
+    id: itemId,
+    type: "message",
+    status: "in_progress",
+    role: "assistant",
+    content: [],
+  };
+  const part = { type: "output_text", text: "", annotations: [] };
+  output.push(item);
+
+  recordWrite("response.created", {
+    response: responseObject({ id: responseId, model: body.model, output }),
+  });
+  recordWrite("response.output_item.added", { output_index: outputIndex, item });
+  item.content.push(part);
+  recordWrite("response.content_part.added", {
+    item_id: itemId,
+    output_index: outputIndex,
+    content_index: 0,
+    part,
+  });
+
+  const controller = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) controller.abort();
+  });
+
+  try {
+    const result = await runCursorAcpTurn({
+      ...runOptionsBase,
+      signal: controller.signal,
+      onDelta: (delta) => {
+        part.text += delta;
+        recordWrite("response.output_text.delta", {
+          item_id: itemId,
+          output_index: outputIndex,
+          content_index: 0,
+          delta,
+        });
+      },
+    });
+    item.status = "completed";
+    recordWrite("response.output_text.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      text: part.text || result.text,
+    });
+    if (!part.text && result.text) part.text = result.text;
+    recordWrite("response.content_part.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part,
+    });
+    recordWrite("response.output_item.done", { output_index: outputIndex, item });
+    recordWrite("response.completed", {
+      response: responseObject({
+        id: responseId,
+        model: body.model,
+        status: "completed",
+        output,
+        usage: result.usage,
+      }),
+    });
+    sseDone(res);
+    res.end();
+    logLine("responses.complete", {
+      status: 200,
+      model: body.model,
+      cursorModel: actualCursorModel,
+      totalMs: Date.now() - startedAt,
+      bytes,
+      runtime: "cursor-acp",
+      stopReason: result.stopReason,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    item.status = "incomplete";
+    recordWrite("response.failed", {
+      response: responseObject({
+        id: responseId,
+        model: body.model,
+        status: "failed",
+        output,
+        error: { message, type: "bridge_error" },
+      }),
+    });
+    sseDone(res);
+    res.end();
+    logLine("responses.stream_error", {
+      status: 200,
+      model: body.model,
+      cursorModel: actualCursorModel,
+      totalMs: Date.now() - startedAt,
+      message,
+      runtime: "cursor-acp",
+    });
+  }
+}
+
 async function forwardResponses(req, res, bodyText) {
+  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
+    return forwardResponsesCursorAcp(req, res, bodyText);
+  }
   if (USE_PI_WRAPPER) {
     return forwardResponsesPi(req, res, bodyText);
   }
@@ -1238,11 +1456,31 @@ function startServer() {
       }
 
       if (url.pathname === "/healthz") {
+        if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
+          const about = cursorAbout({
+            command: CURSOR_ACP_COMMAND,
+            env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+            timeoutMs: 8000,
+          });
+          json(res, 200, {
+            ok: true,
+            provider: PROVIDER_NAME,
+            runtime: "cursor-acp",
+            backend: BACKEND,
+            default_model: DEFAULT_MODEL,
+            cursor_command: CURSOR_ACP_COMMAND,
+            cursor_workspace: CURSOR_WORKSPACE,
+            cursor_model: CURSOR_MODEL,
+            cursor: about,
+          });
+          return;
+        }
         const { accountId } = await loadCodexAuth();
         json(res, 200, {
           ok: true,
           provider: PROVIDER_NAME,
           runtime: USE_PI_WRAPPER ? "pi" : "direct",
+          backend: BACKEND,
           pi_runtime_dir: USE_PI_WRAPPER ? PI_RUNTIME_DIR : null,
           pi_transport: USE_PI_WRAPPER ? PI_TRANSPORT : null,
           default_model: DEFAULT_MODEL,
@@ -1292,6 +1530,7 @@ function startServer() {
     console.log(`${CLI_NAME} listening on http://${HOST}:${PORT}`);
     console.log(`provider base URL: ${BASE_URL}`);
     console.log(`wireApi: responses`);
+    console.log(`backend: ${BACKEND}`);
   });
 }
 
@@ -1347,7 +1586,9 @@ async function statusCommand() {
     pid: pidRunning ? pid : null,
     base_url: BASE_URL,
     wire_api: "responses",
+    backend: BACKEND,
     default_model: DEFAULT_MODEL,
+    cursor_model: BACKEND === "cursor-acp" || BACKEND === "cursor" ? CURSOR_MODEL : null,
     health: health?.body || null,
     pid_path: PID_PATH,
     log_path: LOG_PATH,
@@ -1373,6 +1614,7 @@ async function startCommand() {
   writeFileSync(PID_PATH, `${child.pid}\n`, { mode: 0o600 });
   console.log(`started pid=${child.pid}`);
   console.log(`base_url=${BASE_URL}`);
+  console.log(`backend=${BACKEND}`);
   console.log(`log=${LOG_PATH}`);
 }
 
@@ -1404,13 +1646,25 @@ function stopCommand() {
 }
 
 function loginCommand() {
-  const result = spawnSync("codex", ["login"], { stdio: "inherit" });
+  const result =
+    BACKEND === "cursor-acp" || BACKEND === "cursor"
+      ? spawnSync(CURSOR_ACP_COMMAND, ["login"], {
+          stdio: "inherit",
+          env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+        })
+      : spawnSync("codex", ["login"], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
 }
 
 function logoutCommand() {
   stopCommand();
-  const result = spawnSync("codex", ["logout"], { stdio: "inherit" });
+  const result =
+    BACKEND === "cursor-acp" || BACKEND === "cursor"
+      ? spawnSync(CURSOR_ACP_COMMAND, ["logout"], {
+          stdio: "inherit",
+          env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+        })
+      : spawnSync("codex", ["logout"], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
 }
 
@@ -1422,6 +1676,7 @@ const CONFIG_SCHEMA = new Map([
   ["host", "string"],
   ["port", "number"],
   ["model", "string"],
+  ["backend", "string"],
   ["authPath", "string"],
   ["copilotDb", "string"],
   ["bridgeKey", "string"],
@@ -1437,6 +1692,12 @@ const CONFIG_SCHEMA = new Map([
   ["piTransport", "string"],
   ["timeoutMs", "number"],
   ["stripTools", "boolean"],
+  ["cursorAcpCommand", "string"],
+  ["cursorApiEndpoint", "string"],
+  ["cursorWorkspace", "string"],
+  ["cursorModel", "string"],
+  ["cursorAcpTimeoutMs", "number"],
+  ["cursorForceCi", "boolean"],
 ]);
 
 function parseConfigInput(key, value) {
@@ -1461,12 +1722,19 @@ function configTemplate() {
     host: HOST,
     port: PORT,
     model: DEFAULT_MODEL,
+    backend: BACKEND,
     reasoningEffort: REASONING_EFFORT,
     usePi: USE_PI_WRAPPER,
     piDir: PI_RUNTIME_DIR,
     piTransport: PI_TRANSPORT,
     timeoutMs: PI_TIMEOUT_MS,
     stripTools: STRIP_COPILOT_TOOLS,
+    cursorAcpCommand: CURSOR_ACP_COMMAND,
+    cursorApiEndpoint: CURSOR_API_ENDPOINT,
+    cursorWorkspace: CURSOR_WORKSPACE,
+    cursorModel: CURSOR_MODEL,
+    cursorAcpTimeoutMs: CURSOR_ACP_TIMEOUT_MS,
+    cursorForceCi: CURSOR_FORCE_CI,
     authPath: AUTH_PATH,
     copilotDb: COPILOT_DB,
   };
@@ -1483,6 +1751,7 @@ function effectiveConfig() {
     host: HOST,
     port: PORT,
     model: DEFAULT_MODEL,
+    backend: BACKEND,
     authPath: AUTH_PATH,
     copilotDb: COPILOT_DB,
     bridgeKeyPresent: Boolean(BRIDGE_KEY),
@@ -1498,6 +1767,12 @@ function effectiveConfig() {
     piTransport: PI_TRANSPORT,
     timeoutMs: PI_TIMEOUT_MS,
     stripTools: STRIP_COPILOT_TOOLS,
+    cursorAcpCommand: CURSOR_ACP_COMMAND,
+    cursorApiEndpoint: CURSOR_API_ENDPOINT,
+    cursorWorkspace: CURSOR_WORKSPACE,
+    cursorModel: CURSOR_MODEL,
+    cursorAcpTimeoutMs: CURSOR_ACP_TIMEOUT_MS,
+    cursorForceCi: CURSOR_FORCE_CI,
     baseUrl: BASE_URL,
   };
 }

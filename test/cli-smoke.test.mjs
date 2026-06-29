@@ -3,10 +3,12 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { responsesBodyToCursorPrompt } from "../src/cursor-acp.js";
 
 const root = new URL("..", import.meta.url).pathname;
 const cli = join(root, "src", "cli.js");
-const testConfig = join(root, ".tmp-config.json");
+const testConfig = join(root, `.tmp-config-${process.pid}.json`);
+const testStateDir = join(root, `.tmp-state-${process.pid}`);
 
 function run(args, env = {}) {
   return execFileSync(process.execPath, [cli, ...args], {
@@ -14,7 +16,7 @@ function run(args, env = {}) {
     env: {
       ...process.env,
       SUB_BRIDGE_CONFIG: testConfig,
-      SUB_BRIDGE_STATE_DIR: join(root, ".tmp-state"),
+      SUB_BRIDGE_STATE_DIR: testStateDir,
       ...env,
     },
     encoding: "utf8",
@@ -32,6 +34,7 @@ test("shows config path and effective config", () => {
   const output = JSON.parse(run(["config", "show"]));
   assert.equal(output.configPath, testConfig);
   assert.equal(output.effective.host, "127.0.0.1");
+  assert.equal(output.effective.backend, "codex");
   assert.equal(output.effective.reasoningEffort, "xhigh");
 });
 
@@ -55,4 +58,22 @@ test("lists bridge models", () => {
   const models = JSON.parse(run(["models"]));
   assert.equal(models.object, "list");
   assert.ok(models.data.some((model) => model.id === "gpt-5.5"));
+});
+
+test("converts responses input to Cursor ACP prompt blocks", () => {
+  const prompt = responsesBodyToCursorPrompt({
+    instructions: "Be concise.",
+    input: [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "Say pong." }],
+      },
+    ],
+  });
+  assert.deepEqual(prompt, [
+    {
+      type: "text",
+      text: "Instructions:\nBe concise.\n\nuser:\nSay pong.",
+    },
+  ]);
 });
