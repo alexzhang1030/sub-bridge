@@ -1,5 +1,8 @@
+dist/
 node_modules/
 .tmp-state/
 .tmp-config*.json
+.tmp-debug-config.json
+session
 npm-debug.log*
 .DS_Store

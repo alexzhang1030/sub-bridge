@@ -8,8 +8,9 @@ Local OpenAI Responses bridge for GitHub Copilot custom providers.
 ./install.sh
 ```
 
-Installs `sub-bridge` to `~/.local/bin`, creates `cursor` and `codex`
-subscriptions, fetches models, and writes Copilot provider rows when
+Installs `sub-bridge` to `~/.local/bin` and the bundled runtime to
+`~/.local/lib/sub-bridge`, creates `cursor` and `codex` subscriptions,
+fetches models, and writes Copilot provider rows when
 `~/.copilot/data.db` exists.
 
 ```bash
@@ -17,6 +18,17 @@ subscriptions, fetches models, and writes Copilot provider rows when
 ./install.sh --launch-agent
 ./install.sh --no-copilot
 ```
+
+## Uninstall
+
+```bash
+./uninstall.sh
+./uninstall.sh --launch-agents
+./uninstall.sh --remove-config --purge-data
+```
+
+Removes the command and runtime by default. Config and encrypted secrets
+are kept unless you pass `--remove-config` or `--purge-data`.
 
 ## Start
 
@@ -38,8 +50,8 @@ sub-bridge --sub codex check
 SUB_BRIDGE_CURSOR_AUTH_TOKEN=... sub-bridge --sub cursor login
 ```
 
-The token is stored as encrypted local state at
-`~/.local/state/sub-bridge-cli/cursor-auth/token.enc`.
+The token is stored in the encrypted secrets vault at
+`~/.local/state/sub-bridge-cli/cursor-auth/vault.enc`.
 
 ## Config
 
@@ -60,8 +72,8 @@ Shape:
       "type": "cursor-acp",
       "host": "127.0.0.1",
       "port": 17876,
-      "providerId": "codexsub-openai-codex",
-      "providerName": "SubBridge",
+      "providerId": "subbridge-cursor",
+      "providerName": "SubBridge Cursor",
       "models": [
         {
           "id": "claude-haiku-4-5",

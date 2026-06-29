@@ -19,8 +19,8 @@ export const cursorAcpProviderPlugin = {
   aliases: ["cursor"],
   defaultSubNames: ["cursor"],
   defaultPort: 17876,
-  defaultProviderId: "codexsub-openai-codex",
-  defaultProviderName: "SubBridge",
+  defaultProviderId: "subbridge-cursor",
+  defaultProviderName: "SubBridge Cursor",
   matchesType(type) {
     return this.id === cleanType(type) || this.aliases.includes(cleanType(type));
   },

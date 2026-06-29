@@ -1,3 +1,4 @@
+// @ts-nocheck
 export const CURSOR_LIST_AVAILABLE_MODELS_METHOD = "cursor/list_available_models";
 
 function normalizedText(value) {
@@ -825,6 +826,22 @@ export function mergeCursorModelOptions(...sources) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+export function resolveReasoningEffortForModel(modelConfig, fallbackReasoningEffort) {
+  if (!modelConfig || typeof modelConfig !== "object") return undefined;
+  if (typeof modelConfig.reasoningEffort === "string" && modelConfig.reasoningEffort.trim()) {
+    return modelConfig.reasoningEffort.trim();
+  }
+  if (typeof modelConfig.defaultReasoningEffort === "string" && modelConfig.defaultReasoningEffort.trim()) {
+    return modelConfig.defaultReasoningEffort.trim();
+  }
+  if (Array.isArray(modelConfig.supportedReasoningEfforts) && modelConfig.supportedReasoningEfforts.length > 0) {
+    const defaultEntry = modelConfig.supportedReasoningEfforts.find((item) => item?.isDefault);
+    if (defaultEntry?.value) return String(defaultEntry.value);
+    return fallbackReasoningEffort;
+  }
+  return undefined;
+}
+
 function cursorAcpParameterKeyForModel(baseModel, options) {
   if (options?.reasoningEffort && String(baseModel || "").includes("claude")) return "effort";
   return "reasoning";
@@ -855,11 +872,18 @@ function resolveCursorChoiceParameterValue({ choices, baseModel, key, requestedV
   return sawParameterizedChoice ? undefined : requestedValue;
 }
 
-function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choices }) {
-  if (!acpModelValue.includes("[") || !options || Object.keys(options).length === 0) return undefined;
-  const baseModel = stripCursorParameterizedSuffix(acpModelValue);
-  const params = cursorModelParametersToObject(acpModelValue);
-  if (options.reasoningEffort) {
+function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choices, requestedModel }) {
+  const hasOptions = options && Object.keys(options).length > 0;
+  const requestedHasParams = String(requestedModel || "").includes("[");
+  if (!hasOptions && !requestedHasParams) return undefined;
+  const baseModel = stripCursorParameterizedSuffix(acpModelValue || requestedModel);
+  const requestedParams = cursorModelParametersToObject(requestedModel || "");
+  const acpParams = cursorModelParametersToObject(acpModelValue);
+  const params = { ...requestedParams, ...acpParams };
+  const requestedParamKeys = new Set(Object.keys(requestedParams));
+  const acpParamKeys = new Set(Object.keys(acpParams));
+  const slugUsesParam = (key) => requestedParamKeys.has(key) || acpParamKeys.has(key);
+  if (options.reasoningEffort && (slugUsesParam("reasoning") || slugUsesParam("effort"))) {
     const parameterKey = cursorAcpParameterKeyForModel(baseModel, options);
     params[parameterKey] =
       resolveCursorChoiceParameterValue({
@@ -869,9 +893,9 @@ function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choi
         requestedValue: options.reasoningEffort,
       }) || cursorReasoningParameterValue(options.reasoningEffort);
   }
-  if (options.contextWindow) params.context = options.contextWindow;
-  if (typeof options.fastMode === "boolean") params.fast = String(options.fastMode);
-  if (typeof options.thinking === "boolean") params.thinking = String(options.thinking);
+  if (options.contextWindow && slugUsesParam("context")) params.context = options.contextWindow;
+  if (typeof options.fastMode === "boolean" && slugUsesParam("fast")) params.fast = String(options.fastMode);
+  if (typeof options.thinking === "boolean" && slugUsesParam("thinking")) params.thinking = String(options.thinking);
   return buildCursorParameterizedModelSlug(baseModel, params);
 }
 
@@ -986,14 +1010,81 @@ export function resolveCursorAcpModelValue(configOptions, model, options) {
       acpModelValue,
       options: inferredOptions,
       choices,
+      requestedModel: trimmed,
     }) || acpModelValue;
 
   if (choices.some((choice) => choice.slug === resolvedModel)) return resolvedModel;
-  return (
+  const matchedChoice =
     findCursorModelChoiceIgnoringFast(choices, resolvedModel) ||
-    findCursorModelChoiceWithSupportedParameters(choices, resolvedModel) ||
-    (acpModelValue.includes("[") ? resolvedModel : acpModelValue)
-  );
+    findCursorModelChoiceWithSupportedParameters(choices, resolvedModel);
+  if (matchedChoice) return matchedChoice;
+  if (
+    trimmed.includes("[") &&
+    stripCursorParameterizedSuffix(trimmed) === stripCursorParameterizedSuffix(acpModelValue)
+  ) {
+    const bracketCandidate = resolvedModel.includes("[") ? resolvedModel : trimmed;
+    if (choices.some((choice) => choice.slug === bracketCandidate)) return bracketCandidate;
+    const bracketParams = parseCursorModelParameters(bracketCandidate);
+    const optionBackedOnly = [...bracketParams.keys()].every((key) =>
+      key === "fast" || key === "thinking" || key === "context",
+    );
+    if (optionBackedOnly && choices.some((choice) => choice.slug === acpModelValue)) {
+      return acpModelValue;
+    }
+    if (optionBackedOnly && choices.some((choice) => stripCursorParameterizedSuffix(choice.slug) === baseModel)) {
+      return acpModelValue.includes("[") ? stripCursorParameterizedSuffix(acpModelValue) : acpModelValue;
+    }
+    return acpModelValue.includes("[") ? stripCursorParameterizedSuffix(acpModelValue) : acpModelValue;
+  }
+  return acpModelValue.includes("[") ? resolvedModel : acpModelValue;
+}
+
+export function modelSupportsAcpReasoningConfig(configOptions, modelValue) {
+  const baseModel = stripCursorParameterizedSuffix(String(modelValue || "").trim());
+  if (!baseModel || baseModel === "auto") return false;
+  if (/^composer(?:[-[]|$)/u.test(baseModel)) return false;
+
+  const choices = flattenCursorAcpModelChoices(Array.isArray(configOptions) ? configOptions : []);
+  const reasoningInChoices = choices.some((choice) => {
+    if (stripCursorParameterizedSuffix(choice.slug) !== baseModel) return false;
+    const params = parseCursorModelParameters(choice.slug);
+    return params.has("reasoning") || params.has("effort");
+  });
+  if (reasoningInChoices) return true;
+  return Boolean(findConfigOption(configOptions, ["effort", "reasoning", "thought level"]));
+}
+
+export function validateCursorAcpModelValue(configOptions, modelValue) {
+  const trimmed = String(modelValue || "").trim();
+  if (!trimmed) return null;
+  const choices = flattenCursorAcpModelChoices(Array.isArray(configOptions) ? configOptions : []);
+  if (choices.length === 0) return null;
+  if (choices.some((choice) => choice.slug === trimmed)) return null;
+  if (findCursorModelChoiceIgnoringFast(choices, trimmed)) return null;
+  if (findCursorModelChoiceWithSupportedParameters(choices, trimmed)) return null;
+
+  const baseModel = stripCursorParameterizedSuffix(trimmed);
+  if (!choices.some((choice) => stripCursorParameterizedSuffix(choice.slug) === baseModel)) {
+    return `Invalid params: Invalid model value: ${trimmed}`;
+  }
+
+  const params = parseCursorModelParameters(trimmed);
+  if (params.has("reasoning") || params.has("effort")) {
+    if (!modelSupportsAcpReasoningConfig(configOptions, trimmed)) {
+      return `Invalid params: Invalid model value: ${trimmed}`;
+    }
+    const reasoningInChoices = choices.some((choice) => {
+      if (stripCursorParameterizedSuffix(choice.slug) !== baseModel) return false;
+      const choiceParams = parseCursorModelParameters(choice.slug);
+      return choiceParams.has("reasoning") || choiceParams.has("effort");
+    });
+    const hasReasoningConfig = Boolean(findConfigOption(configOptions, ["effort", "reasoning", "thought level"]));
+    if (!reasoningInChoices && !hasReasoningConfig) {
+      return `Invalid params: Invalid model value: ${trimmed}`;
+    }
+  }
+
+  return null;
 }
 
 function toConfigValue(option, value) {
@@ -1028,7 +1119,7 @@ function toConfigValue(option, value) {
   return undefined;
 }
 
-export function collectCursorAcpConfigUpdates(configOptions, options) {
+export function collectCursorAcpConfigUpdates(configOptions, options, modelValue) {
   if (!options) return [];
   const source = Array.isArray(configOptions) ? configOptions : [];
   const updates = [];
@@ -1041,7 +1132,9 @@ export function collectCursorAcpConfigUpdates(configOptions, options) {
     updates.push({ configId: option.id, value: configValue });
   };
 
-  pushUpdate(["effort", "reasoning", "thought level"], options.reasoningEffort);
+  if (modelSupportsAcpReasoningConfig(source, modelValue)) {
+    pushUpdate(["effort", "reasoning", "thought level"], options.reasoningEffort);
+  }
   pushUpdate(["context", "context size", "context window"], options.contextWindow);
   pushUpdate(["fast", "fast mode"], options.fastMode);
   pushUpdate(["thinking"], options.thinking);

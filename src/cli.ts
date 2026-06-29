@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+// @ts-nocheck — remove after cli.ts is split into typed modules
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -15,17 +15,17 @@ import {
 import { homedir, platform, release, arch } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
-import { cursorAbout, fetchCursorAcpModels, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
-import { defaultCursorAcpCommand, makeCursorProbeEnv } from "./cursor-runtime.js";
-import { errorMessage, isAbortLikeError, isRetryableTransientError } from "./errors.js";
+import { randomUUID } from "node:crypto";
+import { cursorAbout, fetchCursorAcpModels, makeCursorEnv, runCursorAcpTurn, shutdownCursorAcpRuntimes } from "./cursor-acp";
+import { defaultCursorAcpCommand, makeCursorProbeEnv } from "./cursor-runtime";
+import { errorMessage, isAbortLikeError, isRetryableTransientError } from "./errors";
 import {
   defaultProviderId as defaultPluginProviderId,
   defaultProviderName as defaultPluginProviderName,
   defaultProviderPort,
   defaultProviderTypeForSub,
   providerPluginForType,
-} from "./provider-plugins.js";
+} from "./provider-plugins";
 import {
   cursorOptionsFromModelEntry,
   filterCursorModelsByGroups,
@@ -33,15 +33,76 @@ import {
   mergeCursorModelOptions,
   normalizeModelGroupsConfig,
   parseCursorCliModelList,
+  resolveReasoningEffortForModel,
   summarizeCursorModelGroups,
   stripCursorParameterizedSuffix,
-} from "./cursor-models.js";
+} from "./cursor-models";
+import {
+  beginResponsesSseStream,
+  createSseRecorder,
+  emitResponseInProgress,
+  flushResponsesSseStream,
+  normalizeResponseUsage,
+  responseObject,
+  sseDone,
+} from "./app/wire/sse";
+import {
+  chatCompletionObject,
+  chatCompletionsBodyToResponsesBody,
+  chatMessageFromResponsesOutput,
+  formatChatCompletionSseChunk,
+} from "./app/wire/completions";
+import {
+  ensurePrivateDir,
+  json,
+  logPrefix,
+  readJson,
+  readRequestBody,
+  requireBridgeAuth,
+  writeJson,
+} from "./app/lib/http";
+import {
+  loadCursorAuthToken as loadCursorAuthTokenFromVault,
+  cursorAuthTokenPresent as cursorAuthTokenPresentInVault,
+  removeCursorAuthToken as removeCursorAuthTokenFromVault,
+  makeBridgeCursorEnv as buildBridgeCursorEnv,
+  makeCursorRuntimeEnv as buildCursorRuntimeEnv,
+} from "./app/auth/cursor-local";
+import { loadCodexAuth as loadCodexAuthFromFile, decodeJwtPayload, extractAccountId } from "./app/auth/codex-oauth";
+import { BUILTIN_MODELS, normalizeModelEntry, normalizeModelList } from "./app/models/registry";
+import {
+  normalizeModelId,
+  normalizeRequestBody,
+  requestUsesCopilotNativeStream,
+} from "./app/wire/normalize";
+import { normalizeToolCallIds } from "./app/wire/tool-ids";
+import {
+  allowedCopilotToolNames,
+  appendCursorJsonOutputFromEvents,
+  copilotNativeToolCallToFunctionCallItem,
+  cursorExtensionPayloadToFunctionCallItem,
+  cursorToolArguments,
+  cursorToolCallToFunctionCallItem,
+  cursorToolName,
+  cursorToolStatusIsTerminal,
+  extractCopilotToolCallsFromText,
+  pushFunctionCallItem,
+  resolveCursorAcpModel,
+  stripCompanionAssistantMessagesWhenFunctionCalls,
+} from "./app/wire/copilot-tools";
 
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const TOKEN_URL = "https://auth.openai.com/oauth/token";
+import {
+  resolveCodexTokenUrl,
+  resolveSecret,
+  saveSecret,
+  deleteSecret,
+  listStoredSecrets,
+  secretDoctorEntry,
+  SecretName,
+} from "./secrets";
+
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
-const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 
 const CLI_NAME = "sub-bridge";
 const CONFIG_VERSION = 1;
@@ -94,6 +155,10 @@ function subEnvKey(suffix) {
 function envKeysForSub(suffix, fallbackKeys = []) {
   return [subEnvKey(suffix), ...fallbackKeys].filter(Boolean);
 }
+
+const CODEX_TOKEN_URL = resolveCodexTokenUrl(
+  envKeysForSub("CODEX_TOKEN_URL", ["SUB_BRIDGE_CODEX_TOKEN_URL", "CODEX_TOKEN_URL"]),
+);
 
 function defaultTypeForSub(subName) {
   return defaultProviderTypeForSub(subName);
@@ -219,7 +284,6 @@ const PORT = configNumber(
   defaultPortForSub(SUB_NAME, BACKEND),
 );
 const DEFAULT_MODEL_OVERRIDE = envValue(...envKeysForSub("MODEL", ["SUB_BRIDGE_MODEL", "CODEXSUB_MODEL"]));
-const BRIDGE_KEY = configValue("bridgeKey", envKeysForSub("KEY", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"]), "");
 const ORIGINATOR = configValue(
   "originator",
   envKeysForSub("ORIGINATOR", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB_ORIGINATOR"]),
@@ -275,7 +339,17 @@ const PI_TIMEOUT_MS = configNumber("timeoutMs", ["SUB_BRIDGE_TIMEOUT_MS", "GPT_S
 const STRIP_COPILOT_TOOLS = configBoolean(
   "stripTools",
   ["SUB_BRIDGE_STRIP_TOOLS", "GPT_SUB_BRIDGE_STRIP_TOOLS", "CODEXSUB_STRIP_TOOLS"],
-  USE_PI_WRAPPER ? "0" : "1",
+  "0",
+);
+const SYNC_RESPONSES = configBoolean(
+  "syncResponses",
+  envKeysForSub("SYNC_RESPONSES", ["SUB_BRIDGE_SYNC_RESPONSES"]),
+  "1",
+);
+const COPILOT_SSE_DATA_ONLY = configBoolean(
+  "copilotSseDataOnly",
+  envKeysForSub("COPILOT_SSE_DATA_ONLY", ["SUB_BRIDGE_COPILOT_SSE_DATA_ONLY"]),
+  "1",
 );
 const BASE_URL = `http://${HOST}:${PORT}/v1`;
 const HEALTH_URL = `http://${HOST}:${PORT}/healthz`;
@@ -309,116 +383,20 @@ const OFFLINE_DISCOVERY = configBoolean(
 const CURSOR_LOCAL_AUTH_DIR =
   envValue(...envKeysForSub("CURSOR_AUTH_DIR", ["SUB_BRIDGE_CURSOR_AUTH_DIR"])) ||
   join(DEFAULT_STATE_DIR, "cursor-auth");
+const SECRETS_DIR =
+  envValue(...envKeysForSub("SECRETS_DIR", ["SUB_BRIDGE_SECRETS_DIR"])) || CURSOR_LOCAL_AUTH_DIR;
 const CURSOR_LOCAL_AUTH_KEY_PATH = join(CURSOR_LOCAL_AUTH_DIR, "key");
 const CURSOR_LOCAL_AUTH_TOKEN_PATH = join(CURSOR_LOCAL_AUTH_DIR, "token.enc");
+const BRIDGE_KEY = resolveSecret(
+  SECRETS_DIR,
+  SecretName.BRIDGE_KEY,
+  envKeysForSub("KEY", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"]),
+).value;
 let piRuntimePromise = null;
 
 function logLine(message, fields = {}) {
   const suffix = Object.keys(fields).length > 0 ? ` ${JSON.stringify(fields)}` : "";
   console.log(`${new Date().toISOString()} ${message}${suffix}`);
-}
-
-const BUILTIN_MODELS = [
-  {
-    id: "gpt-5.5",
-    displayName: "SubBridge GPT-5.5",
-    contextWindow: 272000,
-    maxTokens: 128000,
-  },
-  {
-    id: "gpt-5.4",
-    displayName: "SubBridge GPT-5.4",
-    contextWindow: 272000,
-    maxTokens: 128000,
-  },
-  {
-    id: "gpt-5.4-mini",
-    displayName: "SubBridge GPT-5.4 mini",
-    contextWindow: 272000,
-    maxTokens: 128000,
-  },
-  {
-    id: "gpt-5.3-codex-spark",
-    displayName: "SubBridge GPT-5.3 Codex Spark",
-    contextWindow: 128000,
-    maxTokens: 128000,
-  },
-];
-
-function normalizeModelEntry(model) {
-  if (!model || typeof model !== "object") return null;
-  const rawId = model.id || model.slug || model.value || model.modelId || model.name;
-  const id = typeof rawId === "string" && rawId.trim() ? rawId.trim() : "";
-  if (!id) return null;
-  const entry = {
-    id,
-    displayName:
-      typeof model.displayName === "string" && model.displayName.trim()
-        ? model.displayName.trim()
-        : typeof model.name === "string" && model.name.trim()
-          ? model.name.trim()
-        : `SubBridge ${id}`,
-    contextWindow: Number.isFinite(Number(model.contextWindow)) ? Number(model.contextWindow) : 128000,
-    maxTokens: Number.isFinite(Number(model.maxTokens)) ? Number(model.maxTokens) : 128000,
-  };
-  for (const key of [
-    "reasoningEffort",
-    "defaultReasoningEffort",
-    "cursorContextWindow",
-    "cursorContext",
-    "contextOption",
-    "defaultContextWindow",
-    "cursorModel",
-    "upstreamProviderId",
-    "upstreamProviderName",
-  ]) {
-    if (typeof model[key] === "string" && model[key].trim()) entry[key] = model[key].trim();
-  }
-  for (const key of ["fastMode", "thinking", "supportsFastMode"]) {
-    if (typeof model[key] === "boolean") entry[key] = model[key];
-  }
-  const supportsThinking = model.supportsThinking ?? model.supportsThinkingToggle;
-  if (typeof supportsThinking === "boolean") entry.supportsThinking = supportsThinking;
-  if (Array.isArray(model.supportedReasoningEfforts)) {
-    entry.supportedReasoningEfforts = model.supportedReasoningEfforts
-      .map((item) => {
-        if (typeof item === "string") return { value: item, label: item };
-        if (!item || typeof item !== "object" || !item.value) return null;
-        return {
-          value: String(item.value),
-          label: String(item.label || item.value),
-          ...(item.isDefault === true ? { isDefault: true } : {}),
-        };
-      })
-      .filter(Boolean);
-  }
-  if (Array.isArray(model.contextWindowOptions)) {
-    entry.contextWindowOptions = model.contextWindowOptions
-      .map((item) => {
-        if (typeof item === "string") return { value: item, label: item.toUpperCase() };
-        if (!item || typeof item !== "object" || !item.value) return null;
-        return {
-          value: String(item.value),
-          label: String(item.label || item.value),
-          ...(item.isDefault === true ? { isDefault: true } : {}),
-        };
-      })
-      .filter(Boolean);
-  }
-  return entry;
-}
-
-function normalizeModelList(models) {
-  if (!Array.isArray(models)) return [];
-  const seen = new Set();
-  const normalized = [];
-  for (const model of models) {
-    const entry = normalizeModelEntry(model);
-    if (!entry || seen.has(entry.id)) continue;
-    seen.add(entry.id);
-    normalized.push(entry);
-  }
-  return normalized;
 }
 
 function activeModels() {
@@ -449,7 +427,7 @@ function defaultModelFromModels() {
 const DEFAULT_MODEL = defaultModelFromModels();
 
 function modelConfigFor(modelId) {
-  const normalized = normalizeModelId(modelId);
+  const normalized = normalizeModelId(modelId, DEFAULT_MODEL);
   const base = stripCursorParameterizedSuffix(normalized);
   return (
     MODELS.find((model) => model.id === normalized) ||
@@ -459,13 +437,14 @@ function modelConfigFor(modelId) {
 }
 
 function reasoningEffortForModel(modelId) {
-  return modelConfigFor(modelId)?.reasoningEffort || REASONING_EFFORT;
+  return resolveReasoningEffortForModel(modelConfigFor(modelId), REASONING_EFFORT);
 }
 
 function cursorOptionsForModel(modelId, body) {
   const modelConfig = modelConfigFor(modelId);
-  const bodyReasoning = body?.reasoning?.effort ? { reasoningEffort: body.reasoning.effort } : null;
-  return mergeCursorModelOptions(cursorOptionsFromModelEntry(modelConfig), bodyReasoning);
+  const effort = reasoningEffortForModel(modelId);
+  const resolvedReasoning = effort ? { reasoningEffort: effort } : null;
+  return mergeCursorModelOptions(cursorOptionsFromModelEntry(modelConfig), resolvedReasoning);
 }
 
 function usage(exitCode = 0) {
@@ -491,6 +470,10 @@ function usage(exitCode = 0) {
   ${CLI_NAME} targets
   ${CLI_NAME} install copilot
 
+  sub-bridge secrets list
+  sub-bridge secrets set <name> <value>
+  sub-bridge secrets unset <name>
+
 Aliases:
   serve = start
   probe = check
@@ -504,6 +487,9 @@ Environment:
   SUB_BRIDGE_MODEL=gpt-5.5
   SUB_BRIDGE_TYPE=codex|cursor-acp
   SUB_BRIDGE_KEY=optional-local-key
+  SUB_BRIDGE_CODEX_CLIENT_ID=required-for-codex-token-refresh
+  SUB_BRIDGE_CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
+  SUB_BRIDGE_SECRETS_DIR=${SECRETS_DIR}
   SUB_BRIDGE_REASONING_EFFORT=xhigh
   SUB_BRIDGE_CURSOR_ACP_COMMAND=${CURSOR_ACP_COMMAND}
   SUB_BRIDGE_CURSOR_WORKSPACE=${CURSOR_WORKSPACE}
@@ -513,219 +499,67 @@ Environment:
   process.exit(exitCode);
 }
 
-function readJson(path) {
-  return JSON.parse(readFileSync(path, "utf8"));
+function codexClientId() {
+  return resolveSecret(
+    SECRETS_DIR,
+    SecretName.CODEX_CLIENT_ID,
+    envKeysForSub("CODEX_CLIENT_ID", ["SUB_BRIDGE_CODEX_CLIENT_ID", "CODEX_CLIENT_ID"]),
+    { required: true },
+  ).value;
 }
 
-function writeJson(path, value) {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-}
-
-function ensurePrivateDir(path) {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  try {
-    chmodSync(path, 0o700);
-  } catch {}
-}
-
-function readOrCreateCursorAuthKey() {
-  ensurePrivateDir(CURSOR_LOCAL_AUTH_DIR);
-  if (existsSync(CURSOR_LOCAL_AUTH_KEY_PATH)) {
-    const key = Buffer.from(readFileSync(CURSOR_LOCAL_AUTH_KEY_PATH, "utf8").trim(), "base64");
-    if (key.length === 32) return key;
-  }
-  const key = randomBytes(32);
-  writeFileSync(CURSOR_LOCAL_AUTH_KEY_PATH, `${key.toString("base64")}\n`, { mode: 0o600 });
-  try {
-    chmodSync(CURSOR_LOCAL_AUTH_KEY_PATH, 0o600);
-  } catch {}
-  return key;
-}
-
-function saveCursorAuthToken(token) {
-  const cleanToken = String(token || "").trim();
-  if (!cleanToken) throw new Error("Cursor token is empty");
-  const key = readOrCreateCursorAuthKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const ciphertext = Buffer.concat([cipher.update(cleanToken, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  writeJson(CURSOR_LOCAL_AUTH_TOKEN_PATH, {
-    version: 1,
-    algorithm: "aes-256-gcm",
-    iv: iv.toString("base64"),
-    tag: tag.toString("base64"),
-    ciphertext: ciphertext.toString("base64"),
-  });
-  try {
-    chmodSync(CURSOR_LOCAL_AUTH_TOKEN_PATH, 0o600);
-  } catch {}
-}
+const cursorAuthEnvKeys = () =>
+  envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]);
 
 function loadCursorAuthToken() {
-  const envToken = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
-  if (envToken && String(envToken).trim()) return String(envToken).trim();
-  if (!existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH)) return "";
-  const payload = readJson(CURSOR_LOCAL_AUTH_TOKEN_PATH);
-  const key = readOrCreateCursorAuthKey();
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(payload.iv, "base64"));
-  decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(payload.ciphertext, "base64")),
-    decipher.final(),
-  ]).toString("utf8");
+  return loadCursorAuthTokenFromVault(SECRETS_DIR, cursorAuthEnvKeys());
 }
 
 function cursorAuthTokenPresent() {
-  const envToken = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
-  return Boolean(envToken && String(envToken).trim()) || existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH);
+  return cursorAuthTokenPresentInVault(SECRETS_DIR, cursorAuthEnvKeys());
 }
 
 function removeCursorAuthToken() {
-  try {
-    unlinkSync(CURSOR_LOCAL_AUTH_TOKEN_PATH);
-  } catch {}
-}
-
-function cursorLocalEnvDirs() {
-  return {
-    configDir: join(CURSOR_LOCAL_AUTH_DIR, "config"),
-    dataDir: join(CURSOR_LOCAL_AUTH_DIR, "data"),
-    xdgConfigHome: join(CURSOR_LOCAL_AUTH_DIR, "xdg-config"),
-  };
+  removeCursorAuthTokenFromVault(SECRETS_DIR);
 }
 
 function makeBridgeCursorEnv({ includeToken = true, forceCi = CURSOR_FORCE_CI } = {}) {
-  const dirs = cursorLocalEnvDirs();
-  for (const path of Object.values(dirs)) ensurePrivateDir(path);
-  const env = makeCursorEnv({ forceCi });
-  env.AGENT_CLI_CREDENTIAL_STORE = "memory";
-  env.CURSOR_CONFIG_DIR = dirs.configDir;
-  env.CURSOR_DATA_DIR = dirs.dataDir;
-  env.XDG_CONFIG_HOME = dirs.xdgConfigHome;
-  if (includeToken) {
-    const token = loadCursorAuthToken();
-    if (token) env.CURSOR_AUTH_TOKEN = token;
-  }
-  return env;
+  return buildBridgeCursorEnv({
+    secretsDir: SECRETS_DIR,
+    cursorLocalAuthDir: CURSOR_LOCAL_AUTH_DIR,
+    cursorForceCi: forceCi,
+    envKeys: cursorAuthEnvKeys(),
+    includeToken,
+    makeCursorEnv,
+  });
 }
 
 function makeCursorRuntimeEnv({ forceCi = CURSOR_FORCE_CI } = {}) {
-  return cursorAuthTokenPresent()
-    ? makeBridgeCursorEnv({ forceCi })
-    : makeCursorEnv({ forceCi });
-}
-
-function decodeBase64Url(value) {
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  return Buffer.from(padded, "base64").toString("utf8");
-}
-
-function decodeJwtPayload(token) {
-  const parts = String(token || "").split(".");
-  if (parts.length !== 3) return null;
-  try {
-    return JSON.parse(decodeBase64Url(parts[1]));
-  } catch {
-    return null;
-  }
-}
-
-function extractAccountId(accessToken, auth) {
-  if (auth?.tokens?.account_id) return auth.tokens.account_id;
-  const payload = decodeJwtPayload(accessToken);
-  const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
-  if (typeof accountId === "string" && accountId.length > 0) return accountId;
-  throw new Error("Could not extract chatgpt account id from Codex token");
-}
-
-function tokenExpiresSoon(accessToken) {
-  const payload = decodeJwtPayload(accessToken);
-  const exp = payload?.exp;
-  if (typeof exp !== "number") return false;
-  return exp * 1000 < Date.now() + 60_000;
-}
-
-async function refreshAccessToken(auth) {
-  const refreshToken = auth?.tokens?.refresh_token;
-  if (!refreshToken) {
-    throw new Error(`Missing refresh token in ${AUTH_PATH}`);
-  }
-
-  const response = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }),
+  return buildCursorRuntimeEnv({
+    secretsDir: SECRETS_DIR,
+    cursorLocalAuthDir: CURSOR_LOCAL_AUTH_DIR,
+    cursorForceCi: forceCi,
+    envKeys: cursorAuthEnvKeys(),
+    makeCursorEnv,
   });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Codex token refresh failed (${response.status}): ${text || response.statusText}`);
-  }
-
-  const json = await response.json();
-  if (!json?.access_token) {
-    throw new Error(`Codex token refresh returned no access_token: ${JSON.stringify(json)}`);
-  }
-
-  auth.tokens.access_token = json.access_token;
-  if (json.refresh_token) auth.tokens.refresh_token = json.refresh_token;
-  auth.tokens.account_id = extractAccountId(json.access_token, auth);
-  auth.last_refresh = new Date().toISOString();
-  writeJson(AUTH_PATH, auth);
-  return auth;
 }
 
 async function loadCodexAuth({ forceRefresh = false } = {}) {
-  let auth = readJson(AUTH_PATH);
-  const accessToken = auth?.tokens?.access_token;
-  if (!accessToken) {
-    throw new Error(`Missing access token in ${AUTH_PATH}. Run Codex login first.`);
-  }
-  if (forceRefresh || tokenExpiresSoon(accessToken)) {
-    auth = await refreshAccessToken(auth);
-  }
-  const token = auth.tokens.access_token;
-  return { token, accountId: extractAccountId(token, auth) };
-}
-
-function requireBridgeAuth(req) {
-  if (!BRIDGE_KEY) return true;
-  const auth = req.headers.authorization || "";
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const xApiKey = String(req.headers["x-api-key"] || req.headers["api-key"] || "");
-  return bearer === BRIDGE_KEY || xApiKey === BRIDGE_KEY;
-}
-
-function readRequestBody(req, maxBytes = 50 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error(`Request body exceeds ${maxBytes} bytes`));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+  return loadCodexAuthFromFile(() => readJson(AUTH_PATH), {
+    authPath: AUTH_PATH,
+    tokenUrl: CODEX_TOKEN_URL,
+    clientId: codexClientId(),
+    forceRefresh,
   });
 }
 
-function normalizeModelId(model) {
-  let value = typeof model === "string" && model.trim() ? model.trim() : DEFAULT_MODEL;
-  if (value.includes("#")) value = value.slice(value.lastIndexOf("#") + 1);
-  if (value.includes("/")) value = value.slice(value.lastIndexOf("/") + 1);
-  if (value === "codexsub") value = DEFAULT_MODEL;
-  if (value.startsWith("codexsub:")) value = value.slice("codexsub:".length);
-  return value || DEFAULT_MODEL;
+function normalizeRequestBodyForBridge(bodyText, { stripTools = STRIP_COPILOT_TOOLS, req = null } = {}) {
+  return normalizeRequestBody(bodyText, {
+    stripTools,
+    req,
+    defaultModel: DEFAULT_MODEL,
+    reasoningEffortForModel,
+  });
 }
 
 async function loadPiRuntime() {
@@ -817,20 +651,6 @@ function userContentFromResponsesContent(content) {
   return blocks;
 }
 
-function normalizeToolCallIds(item) {
-  let rawItemId = String(item.id || "");
-  let callId = String(item.call_id || "");
-  if (rawItemId.includes("|")) {
-    const parts = rawItemId.split("|");
-    if (!callId) callId = parts[0];
-    rawItemId = parts[1] || "";
-  }
-  if (!callId) callId = rawItemId || `call_${randomUUID().replace(/-/g, "")}`;
-  let itemId = rawItemId || `fc_${randomUUID().replace(/-/g, "")}`;
-  if (!itemId.startsWith("fc_")) itemId = `fc_${itemId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-  return { callId, itemId, combinedId: `${callId}|${itemId}` };
-}
-
 function convertResponsesToolsToPi(tools) {
   if (!Array.isArray(tools)) return [];
   const converted = [];
@@ -852,7 +672,7 @@ function convertResponsesToolsToPi(tools) {
 }
 
 function responsesBodyToPiContext(body) {
-  const model = normalizeModelId(body.model);
+  const model = normalizeModelId(body.model, DEFAULT_MODEL);
   const messages = [];
   const systemParts = [];
   const toolNamesByCallId = new Map();
@@ -944,43 +764,6 @@ function responsesBodyToPiContext(body) {
       tools: tools.length > 0 ? tools : undefined,
     },
     toolsOut: tools.length,
-  };
-}
-
-function sseWrite(res, event, data) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify({ type: event, ...data })}\n\n`);
-}
-
-function sseDone(res) {
-  res.write("data: [DONE]\n\n");
-}
-
-function responseObject({ id, model, status = "in_progress", output = [], usage = null, error = null }) {
-  const response = {
-    id,
-    object: "response",
-    created_at: Math.floor(Date.now() / 1000),
-    status,
-    model,
-    output,
-    parallel_tool_calls: true,
-    tool_choice: "auto",
-    tools: [],
-  };
-  if (usage) response.usage = usage;
-  if (error) response.error = error;
-  return response;
-}
-
-function normalizeResponseUsage(usage) {
-  if (!usage) return null;
-  return {
-    input_tokens: usage.input + usage.cacheRead + usage.cacheWrite,
-    output_tokens: usage.output,
-    total_tokens: usage.totalTokens || usage.input + usage.cacheRead + usage.cacheWrite + usage.output,
-    input_tokens_details: { cached_tokens: usage.cacheRead || 0 },
-    output_tokens_details: { reasoning_tokens: 0 },
   };
 }
 
@@ -1113,73 +896,6 @@ async function collectPiResponse({ provider, model, context, token, sessionId, b
   };
 }
 
-function normalizeRequestBody(bodyText, { stripTools = STRIP_COPILOT_TOOLS } = {}) {
-  let body;
-  if (!bodyText.trim()) {
-    body = {
-      model: DEFAULT_MODEL,
-      store: false,
-      stream: true,
-      instructions: "You are a helpful coding assistant.",
-      input: [],
-    };
-  } else {
-    body = JSON.parse(bodyText);
-  }
-
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw new Error("Responses request body must be a JSON object");
-  }
-
-  body.model = normalizeModelId(body.model);
-  if (body.store === undefined) body.store = false;
-  if (body.stream === undefined) body.stream = true;
-  const effectiveReasoningEffort = reasoningEffortForModel(body.model);
-  if (effectiveReasoningEffort) {
-    const currentReasoning =
-      body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
-        ? body.reasoning
-        : {};
-    body.reasoning = { ...currentReasoning, effort: effectiveReasoningEffort };
-  }
-
-  const strippedParams = [];
-  if (Object.prototype.hasOwnProperty.call(body, "max_output_tokens")) {
-    delete body.max_output_tokens;
-    strippedParams.push("max_output_tokens");
-  }
-
-  const toolsIn = Array.isArray(body.tools) ? body.tools.length : 0;
-  let strippedTools = false;
-  if (stripTools && toolsIn > 0) {
-    delete body.tools;
-    delete body.tool_choice;
-    delete body.parallel_tool_calls;
-    strippedTools = true;
-  }
-  const toolsOut = Array.isArray(body.tools) ? body.tools.length : 0;
-
-  return {
-    body: JSON.stringify(body),
-    info: {
-      model: body.model,
-      stream: body.stream,
-      inputType: Array.isArray(body.input) ? "array" : typeof body.input,
-      toolsIn,
-      toolsOut,
-      strippedTools,
-      strippedParams,
-      reasoningEffort: body.reasoning?.effort || null,
-    },
-  };
-}
-
-function logPrefix(text, maxLength = 1200) {
-  const value = String(text || "");
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, maxLength)}...[truncated ${value.length - maxLength} chars]`;
-}
-
 function codexHeaders(token, accountId, req) {
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${token}`);
@@ -1202,7 +918,7 @@ function codexHeaders(token, accountId, req) {
 
 async function forwardResponsesPi(req, res, bodyText) {
   const startedAt = Date.now();
-  const normalized = normalizeRequestBody(bodyText);
+  const normalized = normalizeRequestBodyForBridge(bodyText, { req });
   const body = JSON.parse(normalized.body);
   const { provider, models } = await loadPiRuntime();
   const model = models.get(body.model) || models.get(DEFAULT_MODEL);
@@ -1221,14 +937,9 @@ async function forwardResponsesPi(req, res, bodyText) {
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
   const output = [];
   const openItems = new Map();
-  let bytes = 0;
   let headerLogged = false;
   const streamStartedAt = Date.now();
-  const recordWrite = (event, data) => {
-    const before = res.writableLength;
-    sseWrite(res, event, data);
-    bytes += Math.max(0, res.writableLength - before);
-  };
+  const { recordWrite, getBytes } = createSseRecorder(res, COPILOT_SSE_DATA_ONLY);
 
   logLine("responses.forward", {
     path: req.url,
@@ -1279,19 +990,19 @@ async function forwardResponsesPi(req, res, bodyText) {
     return;
   }
 
-  res.statusCode = 200;
-  res.setHeader("content-type", "text/event-stream; charset=utf-8");
-  res.setHeader("cache-control", "no-cache");
-  res.setHeader("connection", "keep-alive");
-  res.setHeader("x-sub-bridge-runtime", "pi");
-  res.setHeader("x-sub-bridge-transport", PI_TRANSPORT);
-  if (normalized.info.strippedParams.length > 0) {
-    res.setHeader("x-sub-bridge-stripped-params", normalized.info.strippedParams.join(","));
-  }
+  beginResponsesSseStream(res, {
+    "x-sub-bridge-runtime": "pi",
+    "x-sub-bridge-transport": PI_TRANSPORT,
+    ...(normalized.info.strippedParams.length > 0
+      ? { "x-sub-bridge-stripped-params": normalized.info.strippedParams.join(",") }
+      : {}),
+  });
 
   recordWrite("response.created", {
     response: responseObject({ id: responseId, model: model.id, output }),
   });
+  emitResponseInProgress(recordWrite, responseObject({ id: responseId, model: model.id, output }));
+  flushResponsesSseStream(res);
 
   const controller = new AbortController();
   res.on("close", () => {
@@ -1577,7 +1288,7 @@ async function forwardResponsesPi(req, res, bodyText) {
         model: model.id,
         streamMs: Date.now() - streamStartedAt,
         totalMs: Date.now() - startedAt,
-        bytes,
+        bytes: getBytes(),
         runtime: "pi",
         stopReason: event.reason,
       });
@@ -1649,7 +1360,7 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
   const startedAt = Date.now();
   const { token, accountId } = await loadCodexAuth();
   const url = `${DEFAULT_CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;
-  const normalized = normalizeRequestBody(bodyText);
+  const normalized = normalizeRequestBodyForBridge(bodyText, { req });
   const body = normalized.body;
   logLine("responses.forward", {
     path: req.url,
@@ -1735,136 +1446,17 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
   upstreamStream.pipe(res);
 }
 
-function resolveCursorAcpModel(requestModel) {
-  const modelConfig = modelConfigFor(requestModel);
-  const configured = String(modelConfig?.cursorModel || CURSOR_MODEL || "request").trim();
-  if (!configured || configured === "request") return requestModel;
-  if (configured === "auto" || configured === "default") return "default";
-  return configured;
-}
-
-function safeToolIdentifier(value, fallback = "tool") {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return normalized || fallback;
-}
-
-const CURSOR_COPILOT_TOOL_KINDS = new Set(["execute", "search", "read", "edit", "delete", "move", "fetch", "tool"]);
-
-function cursorToolKind(toolCall) {
-  const kind = safeToolIdentifier(toolCall?.kind || "tool", "tool");
-  return CURSOR_COPILOT_TOOL_KINDS.has(kind) ? kind : "tool";
-}
-
-function cursorToolName(toolCall) {
-  return `subbridge_cursor_${cursorToolKind(toolCall)}`;
-}
-
-function cursorToolArguments(toolCall) {
-  return JSON.stringify({
-    title: toolCall.title || cursorToolName(toolCall),
-    status: toolCall.status || "in_progress",
-    kind: toolCall.kind || "tool",
-    ...(toolCall.detail ? { detail: toolCall.detail } : {}),
-    ...(toolCall.command ? { command: toolCall.command } : {}),
-    ...(toolCall.data?.rawInput !== undefined ? { input: toolCall.data.rawInput } : {}),
-    ...(toolCall.data?.rawOutput !== undefined ? { output: toolCall.data.rawOutput } : {}),
-    ...(toolCall.data?.locations !== undefined ? { locations: toolCall.data.locations } : {}),
-  });
-}
-
-function truncateOneLine(value, maxLength = 240) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (text.length <= maxLength) return text;
-  return `${text.slice(0, maxLength - 3)}...`;
-}
-
-function cursorToolSummaryLine(toolCall) {
-  const status = toolCall?.status || "in_progress";
-  const kind = toolCall?.kind || "tool";
-  const title = toolCall?.title || cursorToolName(toolCall);
-  const detail = toolCall?.command || toolCall?.detail || "";
-  const suffix = detail ? ` - ${truncateOneLine(detail)}` : "";
-  return `[cursor:${kind}:${status}] ${truncateOneLine(title, 120)}${suffix}\n`;
-}
-
-function mergeCursorToolCallState(previous, next) {
-  if (!previous) return next;
-  return {
-    ...previous,
-    ...next,
-    kind: next.kind || previous.kind,
-    status: next.status || previous.status,
-    title: next.title || previous.title,
-    command: next.command || previous.command,
-    detail: next.detail || previous.detail,
-    data: {
-      ...(previous.data || {}),
-      ...(next.data || {}),
-    },
-  };
-}
-
-function cursorToolStatusIsTerminal(status) {
-  return status === "completed" || status === "failed";
-}
-
-function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
-  let reasoningText = "";
-  let assistantText = "";
-  const tools = new Map();
-
-  for (const event of Array.isArray(events) ? events : []) {
-    if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
-      reasoningText += event.text;
-      continue;
-    }
-    if (event.type === "content_delta" && event.streamKind === "assistant_text") {
-      assistantText += event.text;
-      continue;
-    }
-    if (event.type === "tool_call") {
-      const existing = tools.get(event.toolCall.id);
-      const toolCall = mergeCursorToolCallState(existing?.toolCall, event.toolCall);
-      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
-      tools.set(toolCall.id, { toolCall });
-    }
-  }
-
-  for (const entry of tools.values()) {
-    reasoningText += cursorToolSummaryLine(entry.toolCall);
-  }
-
-  if (reasoningText) {
-    output.push({
-      id: `rs_${randomUUID().replace(/-/g, "")}`,
-      type: "reasoning",
-      status: "completed",
-      summary: [{ type: "summary_text", text: reasoningText }],
-    });
-  }
-  const finalText = assistantText || fallbackText;
-  if (finalText) {
-    output.push({
-      id: `msg_${randomUUID().replace(/-/g, "")}`,
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: finalText, annotations: [] }],
-    });
-  }
-}
-
 async function forwardResponsesCursorAcp(req, res, bodyText) {
   const startedAt = Date.now();
-  const normalized = normalizeRequestBody(bodyText, { stripTools: true });
+  const normalized = normalizeRequestBodyForBridge(bodyText, { stripTools: STRIP_COPILOT_TOOLS, req });
   const body = JSON.parse(normalized.body);
+  const copilotTools = Array.isArray(body.tools) ? body.tools : [];
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
   const output = [];
-  const actualCursorModel = resolveCursorAcpModel(body.model);
+  const actualCursorModel = resolveCursorAcpModel(body.model, {
+    cursorModelSetting: CURSOR_MODEL,
+    modelConfigFor,
+  });
 
   logLine("responses.forward", {
     path: req.url,
@@ -1873,7 +1465,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     stream: body.stream,
     inputType: normalized.info.inputType,
     toolsIn: normalized.info.toolsIn,
-    toolsOut: 0,
+    toolsOut: normalized.info.toolsOut,
     strippedTools: normalized.info.strippedTools,
     strippedParams: normalized.info.strippedParams,
     reasoningEffort: normalized.info.reasoningEffort,
@@ -1892,6 +1484,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     reasoningEffort: reasoningEffortForModel(body.model),
     modelOptions: cursorOptionsForModel(body.model, body),
     body,
+    copilotToolNames: allowedCopilotToolNames(copilotTools),
     onStderr: (chunk) => {
       const text = String(chunk || "").trim();
       if (text) logLine("cursor.stderr", { text: logPrefix(text, 500) });
@@ -1906,44 +1499,85 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
     });
-    const result = await runCursorAcpTurn({ ...runOptionsBase, signal: controller.signal });
-    appendCursorJsonOutputFromEvents(output, result.events, result.text);
-    json(res, 200, responseObject({
-      id: responseId,
-      model: body.model,
-      status: "completed",
-      output,
-      usage: result.usage,
-    }));
-    logLine("responses.complete", {
-      status: 200,
-      model: body.model,
-      cursorModel: actualCursorModel,
-      responseFormat: "json",
-      totalMs: Date.now() - startedAt,
-      runtime: "cursor-acp",
-      stopReason: result.stopReason,
-    });
+    try {
+      const result = await runCursorAcpTurn({ ...runOptionsBase, signal: controller.signal });
+      appendCursorJsonOutputFromEvents(output, result.events, result.text, { copilotTools, log: logLine });
+      json(res, 200, responseObject({
+        id: responseId,
+        model: body.model,
+        status: "completed",
+        output,
+        usage: result.usage,
+      }));
+      logLine("responses.complete", {
+        status: 200,
+        model: body.model,
+        cursorModel: actualCursorModel,
+        responseFormat: "json",
+        totalMs: Date.now() - startedAt,
+        runtime: "cursor-acp",
+        stopReason: result.stopReason,
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
+        logLine("responses.cancelled", {
+          status: 200,
+          model: body.model,
+          cursorModel: actualCursorModel,
+          responseFormat: "json",
+          totalMs: Date.now() - startedAt,
+          message,
+          runtime: "cursor-acp",
+        });
+        if (!res.writableEnded && !res.destroyed) {
+          json(res, 200, responseObject({
+            id: responseId,
+            model: body.model,
+            status: "completed",
+            output,
+          }));
+        }
+        return;
+      }
+      output.push({
+        id: `msg_${randomUUID().replace(/-/g, "")}`,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: `Cursor ACP error: ${message}`, annotations: [] }],
+      });
+      json(res, 200, responseObject({
+        id: responseId,
+        model: body.model,
+        status: "completed",
+        output,
+      }));
+      logLine("responses.stream_error", {
+        status: 200,
+        model: body.model,
+        cursorModel: actualCursorModel,
+        responseFormat: "json",
+        totalMs: Date.now() - startedAt,
+        message,
+        runtime: "cursor-acp",
+      });
+    }
     return;
   }
 
-  res.statusCode = 200;
-  res.setHeader("content-type", "text/event-stream; charset=utf-8");
-  res.setHeader("cache-control", "no-cache");
-  res.setHeader("connection", "keep-alive");
-  res.setHeader("x-sub-bridge-runtime", "cursor-acp");
-  res.setHeader("x-sub-bridge-cursor-model", actualCursorModel);
+  beginResponsesSseStream(res, {
+    "x-sub-bridge-runtime": "cursor-acp",
+    "x-sub-bridge-cursor-model": actualCursorModel,
+  });
 
-  let bytes = 0;
-  const recordWrite = (event, data) => {
-    const before = res.writableLength;
-    sseWrite(res, event, data);
-    bytes += Math.max(0, res.writableLength - before);
-  };
+  const { recordWrite, getBytes } = createSseRecorder(res, COPILOT_SSE_DATA_ONLY);
 
   recordWrite("response.created", {
     response: responseObject({ id: responseId, model: body.model, output }),
   });
+  emitResponseInProgress(recordWrite, responseObject({ id: responseId, model: body.model, output }));
+  flushResponsesSseStream(res);
 
   const controller = new AbortController();
   res.on("close", () => {
@@ -1988,8 +1622,19 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   const finishAssistantEntry = () => {
     if (!assistantEntry) return;
     const entry = assistantEntry;
-    entry.item.status = "completed";
+    const extracted = extractCopilotToolCallsFromText(entry.text, allowedCopilotToolNames(copilotTools));
+    entry.text = extracted.text;
     entry.part.text = entry.text;
+    for (const call of extracted.calls) {
+      const outputIndex = addOutputItem(call);
+      recordWrite("response.function_call_arguments.done", {
+        item_id: call.id,
+        output_index: outputIndex,
+        arguments: call.arguments,
+      });
+      recordWrite("response.output_item.done", { output_index: outputIndex, item: call });
+    }
+    entry.item.status = "completed";
     recordWrite("response.output_text.done", {
       item_id: entry.item.id,
       output_index: entry.outputIndex,
@@ -2102,32 +1747,93 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
 
   const applyToolCallEvent = (eventToolCall) => {
     finishAssistantEntry();
-    const existingEntry = toolEntries.get(eventToolCall.id);
-    const toolCall = mergeCursorToolCallState(existingEntry?.toolCall, eventToolCall);
+    const toolCall = eventToolCall;
     logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
-    let entry = existingEntry || { toolCall, startReported: false, terminalReported: false };
-    entry.toolCall = toolCall;
-    if (!existingEntry) toolEntries.set(toolCall.id, entry);
-    if (!entry.startReported && !cursorToolStatusIsTerminal(toolCall.status)) {
-      appendReasoningText(cursorToolSummaryLine(toolCall));
-      entry.startReported = true;
+    let entry = toolEntries.get(toolCall.id);
+    if (!entry) {
+      const item = cursorToolCallToFunctionCallItem(toolCall);
+      const outputIndex = addOutputItem(item);
+      entry = { toolCall, item, outputIndex, terminalReported: false };
+      toolEntries.set(toolCall.id, entry);
+      recordWrite("response.function_call_arguments.delta", {
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: item.arguments,
+      });
+    } else {
+      entry.toolCall = toolCall;
+      entry.item.name = cursorToolName(toolCall);
+      entry.item.arguments = cursorToolArguments(toolCall);
     }
     if (cursorToolStatusIsTerminal(toolCall.status) && !entry.terminalReported) {
-      appendReasoningText(cursorToolSummaryLine(toolCall));
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        arguments: entry.item.arguments,
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
       entry.terminalReported = true;
+      toolEntries.delete(toolCall.id);
     }
   };
 
   const finishOpenToolEntries = () => {
     for (const entry of toolEntries.values()) {
       if (entry.terminalReported) continue;
-      appendReasoningText(cursorToolSummaryLine(entry.toolCall));
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        arguments: entry.item.arguments || "{}",
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
       entry.terminalReported = true;
     }
     toolEntries.clear();
   };
 
+  const applyExtensionEvent = (payload, eventType) => {
+    finishAssistantEntry();
+    logLine(`cursor.${eventType}`, payload);
+    const item = cursorExtensionPayloadToFunctionCallItem(payload);
+    const outputIndex = addOutputItem(item);
+    recordWrite("response.function_call_arguments.delta", {
+      item_id: item.id,
+      output_index: outputIndex,
+      delta: item.arguments,
+    });
+    recordWrite("response.function_call_arguments.done", {
+      item_id: item.id,
+      output_index: outputIndex,
+      arguments: item.arguments,
+    });
+    recordWrite("response.output_item.done", { output_index: outputIndex, item });
+  };
+
+  const applyCopilotToolCallEvent = (event) => {
+    finishAssistantEntry();
+    logLine("cursor.copilot_tool_call", { name: event.name, arguments: event.arguments });
+    const item = copilotNativeToolCallToFunctionCallItem(event);
+    const outputIndex = addOutputItem(item);
+    recordWrite("response.function_call_arguments.delta", {
+      item_id: item.id,
+      output_index: outputIndex,
+      delta: item.arguments,
+    });
+    recordWrite("response.function_call_arguments.done", {
+      item_id: item.id,
+      output_index: outputIndex,
+      arguments: item.arguments,
+    });
+    recordWrite("response.output_item.done", { output_index: outputIndex, item });
+  };
+
   const applyCursorEvent = (event) => {
+    if (event.type === "assistant_segment_completed") {
+      finishAssistantEntry();
+      return;
+    }
     if (event.type === "content_delta" && event.streamKind === "assistant_text") {
       const entry = ensureAssistantEntry();
       entry.text += event.text;
@@ -2146,6 +1852,14 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     }
     if (event.type === "tool_call") {
       applyToolCallEvent(event.toolCall);
+      return;
+    }
+    if (event.type === "plan_updated" || event.type === "question_asked") {
+      applyExtensionEvent(event.payload, event.type);
+      return;
+    }
+    if (event.type === "copilot_tool_call") {
+      applyCopilotToolCallEvent(event);
     }
   };
 
@@ -2158,6 +1872,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     finishReasoningEntry();
     finishAssistantEntry();
     finishOpenToolEntries();
+    stripCompanionAssistantMessagesWhenFunctionCalls(output);
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
@@ -2174,7 +1889,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       model: body.model,
       cursorModel: actualCursorModel,
       totalMs: Date.now() - startedAt,
-      bytes,
+      bytes: getBytes(),
       runtime: "cursor-acp",
       stopReason: result.stopReason,
     });
@@ -2231,14 +1946,196 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   }
 }
 
-async function forwardResponses(req, res, bodyText) {
-  return PROVIDER_PLUGIN.forwardResponses(providerPluginContext(), req, res, bodyText);
+async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
+  const startedAt = Date.now();
+  const chatBody = JSON.parse(bodyText);
+  const responsesBody = chatCompletionsBodyToResponsesBody(chatBody);
+  const normalized = normalizeRequestBodyForBridge(JSON.stringify(responsesBody), { stripTools: STRIP_COPILOT_TOOLS, req });
+  const body = JSON.parse(normalized.body);
+  const copilotTools = Array.isArray(body.tools) ? body.tools : [];
+  const completionId = `chatcmpl_${randomUUID().replace(/-/g, "")}`;
+  const output = [];
+  const actualCursorModel = resolveCursorAcpModel(body.model, {
+    cursorModelSetting: CURSOR_MODEL,
+    modelConfigFor,
+  });
+
+  logLine("completions.forward", {
+    path: req.url,
+    model: body.model,
+    cursorModel: actualCursorModel,
+    stream: body.stream,
+    inputMessages: Array.isArray(chatBody.messages) ? chatBody.messages.length : 0,
+    toolsIn: normalized.info.toolsIn,
+    toolsOut: normalized.info.toolsOut,
+    runtime: "cursor-acp",
+  });
+
+  const runOptionsBase = {
+    command: CURSOR_ACP_COMMAND,
+    apiEndpoint: CURSOR_API_ENDPOINT || undefined,
+    workspace: CURSOR_WORKSPACE,
+    env: makeCursorRuntimeEnv(),
+    timeoutMs: CURSOR_ACP_TIMEOUT_MS,
+    model: actualCursorModel,
+    reasoningEffort: reasoningEffortForModel(body.model),
+    modelOptions: cursorOptionsForModel(body.model, body),
+    body,
+    copilotToolNames: allowedCopilotToolNames(copilotTools),
+    onStderr: (chunk) => {
+      const text = String(chunk || "").trim();
+      if (text) logLine("cursor.stderr", { text: logPrefix(text, 500) });
+    },
+    onProtocolError: (error) => {
+      logLine("cursor.protocol_error", { message: error instanceof Error ? error.message : String(error) });
+    },
+  };
+
+  const controller = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) controller.abort();
+  });
+
+  if (body.stream === false) {
+    try {
+      const result = await runCursorAcpTurn({ ...runOptionsBase, signal: controller.signal });
+      appendCursorJsonOutputFromEvents(output, result.events, result.text, { copilotTools, log: logLine });
+      stripCompanionAssistantMessagesWhenFunctionCalls(output);
+      const message = chatMessageFromResponsesOutput(output);
+      json(res, 200, chatCompletionObject({
+        id: completionId,
+        model: body.model,
+        message,
+        usage: result.usage,
+        finishReason: result.stopReason === "end_turn" ? "stop" : "stop",
+      }));
+      logLine("completions.complete", {
+        status: 200,
+        model: body.model,
+        cursorModel: actualCursorModel,
+        responseFormat: "json",
+        totalMs: Date.now() - startedAt,
+        runtime: "cursor-acp",
+        stopReason: result.stopReason,
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
+        logLine("completions.cancelled", { status: 200, model: body.model, totalMs: Date.now() - startedAt, message });
+        return;
+      }
+      json(res, 200, chatCompletionObject({
+        id: completionId,
+        model: body.model,
+        message: { role: "assistant", content: `Cursor ACP error: ${message}` },
+        finishReason: "stop",
+      }));
+      logLine("completions.error", { status: 200, model: body.model, totalMs: Date.now() - startedAt, message });
+    }
+    return;
+  }
+
+  beginResponsesSseStream(res, {
+    "x-sub-bridge-runtime": "cursor-acp",
+    "x-sub-bridge-cursor-model": actualCursorModel,
+    "x-sub-bridge-wire-api": "completions",
+  });
+
+  let roleSent = false;
+  let toolIndex = 0;
+  const writeChunk = (delta, finishReason = null) => {
+    const choice = { index: 0, delta: delta || {} };
+    if (finishReason) choice.finish_reason = finishReason;
+    const payload = formatChatCompletionSseChunk({
+      id: completionId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: body.model,
+      choices: [choice],
+    });
+    const socket = res.socket;
+    if (typeof socket?.cork === "function") socket.cork();
+    res.write(payload);
+    if (typeof socket?.uncork === "function") socket.uncork();
+  };
+
+  const applyStreamEvent = (event) => {
+    if (event.type === "content_delta" && event.streamKind === "assistant_text" && event.text) {
+      if (!roleSent) {
+        writeChunk({ role: "assistant", content: "" });
+        roleSent = true;
+      }
+      writeChunk({ content: event.text });
+      return;
+    }
+    if (event.type === "tool_call" && cursorToolStatusIsTerminal(event.toolCall?.status)) {
+      const item = cursorToolCallToFunctionCallItem(event.toolCall);
+      writeChunk({
+        tool_calls: [{
+          index: toolIndex,
+          id: item.call_id,
+          type: "function",
+          function: { name: item.name, arguments: item.arguments },
+        }],
+      });
+      toolIndex += 1;
+    }
+  };
+
+  flushResponsesSseStream(res);
+  try {
+    const result = await runCursorAcpTurn({
+      ...runOptionsBase,
+      signal: controller.signal,
+      onEvent: applyStreamEvent,
+    });
+    if (!roleSent && result.text) {
+      writeChunk({ role: "assistant", content: result.text });
+      roleSent = true;
+    }
+    writeChunk({}, "stop");
+    res.write("data: [DONE]\n\n");
+    res.end();
+    logLine("completions.complete", {
+      status: 200,
+      model: body.model,
+      cursorModel: actualCursorModel,
+      responseFormat: "sse",
+      totalMs: Date.now() - startedAt,
+      runtime: "cursor-acp",
+      stopReason: result.stopReason,
+    });
+  } catch (error) {
+    const message = errorMessage(error);
+    if (!isAbortLikeError(error) && !controller.signal.aborted && !res.destroyed) {
+      writeChunk({ content: `Cursor ACP error: ${message}` });
+      writeChunk({}, "stop");
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+    logLine(isAbortLikeError(error) ? "completions.cancelled" : "completions.error", {
+      status: 200,
+      model: body.model,
+      totalMs: Date.now() - startedAt,
+      message,
+    });
+  }
 }
 
-function json(res, status, body) {
-  res.statusCode = status;
-  res.setHeader("content-type", "application/json; charset=utf-8");
-  res.end(`${JSON.stringify(body, null, 2)}\n`);
+async function forwardChatCompletions(req, res, bodyText) {
+  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
+    return forwardChatCompletionsCursorAcp(req, res, bodyText);
+  }
+  json(res, 501, {
+    error: {
+      message: `Chat completions wire API is not implemented for backend ${BACKEND}`,
+      type: "unsupported_backend",
+    },
+  });
+}
+
+async function forwardResponses(req, res, bodyText) {
+  return PROVIDER_PLUGIN.forwardResponses(providerPluginContext(), req, res, bodyText);
 }
 
 function modelsResponse() {
@@ -2274,24 +2171,25 @@ function startServer() {
         return;
       }
 
+      const isCompletionsPath =
+        url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions";
       const isResponsesPath = url.pathname === "/v1/responses" || url.pathname === "/responses";
-      if (isResponsesPath && req.method === "POST") {
-        if (!requireBridgeAuth(req)) {
+      if ((isResponsesPath || isCompletionsPath) && req.method === "POST") {
+        if (!requireBridgeAuth(req, BRIDGE_KEY)) {
           json(res, 401, { error: { message: "Unauthorized", type: "unauthorized" } });
           return;
         }
         const bodyText = await readRequestBody(req);
-        await forwardResponses(req, res, bodyText);
+        if (isCompletionsPath) {
+          await forwardChatCompletions(req, res, bodyText);
+        } else {
+          await forwardResponses(req, res, bodyText);
+        }
         return;
       }
 
-      if (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") {
-        json(res, 400, {
-          error: {
-            message: "SubBridge is configured for OpenAI Responses wire API. Set the provider wireApi to responses.",
-            type: "unsupported_endpoint",
-          },
-        });
+      if (isCompletionsPath || isResponsesPath) {
+        json(res, 405, { error: { message: "Method not allowed", type: "method_not_allowed" } });
         return;
       }
 
@@ -2302,14 +2200,17 @@ function startServer() {
   });
 
   process.on("SIGTERM", () => {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1500).unref();
+    void shutdownCursorAcpRuntimes().finally(() => {
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1500).unref();
+    });
   });
 
   server.listen(PORT, HOST, () => {
     console.log(`${CLI_NAME} listening on http://${HOST}:${PORT}`);
     console.log(`provider base URL: ${BASE_URL}`);
-    console.log(`wireApi: responses`);
+    console.log(`wireApi: completions+responses`);
+    console.log(`syncResponses: ${SYNC_RESPONSES} (legacy; response format follows request stream flag)`);
     console.log(`type: ${BACKEND}`);
   });
 }
@@ -2418,7 +2319,8 @@ async function statusCommand() {
     subscription: SUB_NAME || null,
     pid: pidRunning ? pid : null,
     base_url: BASE_URL,
-    wire_api: "responses",
+    wire_api: "completions+responses",
+    sync_responses: SYNC_RESPONSES,
     type: BACKEND,
     default_model: DEFAULT_MODEL,
     ...pluginStatusFields,
@@ -2518,12 +2420,70 @@ function codexAuthDoctor() {
 }
 
 function cursorAuthDoctor() {
+  const token = secretDoctorEntry(
+    SECRETS_DIR,
+    SecretName.CURSOR_AUTH_TOKEN,
+    envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]),
+  );
   return {
-    dir: CURSOR_LOCAL_AUTH_DIR,
-    tokenPath: CURSOR_LOCAL_AUTH_TOKEN_PATH,
-    tokenExists: existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH),
-    envTokenPresent: Boolean(envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]))),
+    dir: SECRETS_DIR,
+    vaultPath: join(SECRETS_DIR, "vault.enc"),
+    tokenConfigured: token.configured,
+    tokenSource: token.source,
   };
+}
+
+function secretsDoctor() {
+  return {
+    dir: SECRETS_DIR,
+    vaultPath: join(SECRETS_DIR, "vault.enc"),
+    stored: listStoredSecrets(SECRETS_DIR),
+    codexClientId: secretDoctorEntry(
+      SECRETS_DIR,
+      SecretName.CODEX_CLIENT_ID,
+      envKeysForSub("CODEX_CLIENT_ID", ["SUB_BRIDGE_CODEX_CLIENT_ID", "CODEX_CLIENT_ID"]),
+    ),
+    bridgeKey: secretDoctorEntry(
+      SECRETS_DIR,
+      SecretName.BRIDGE_KEY,
+      envKeysForSub("KEY", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"]),
+    ),
+    cursorAuthToken: secretDoctorEntry(
+      SECRETS_DIR,
+      SecretName.CURSOR_AUTH_TOKEN,
+      envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]),
+    ),
+  };
+}
+
+function secretsCommand(args) {
+  const action = args[0];
+  if (action === "list") {
+    console.log(JSON.stringify({ dir: SECRETS_DIR, secrets: listStoredSecrets(SECRETS_DIR) }, null, 2));
+    return;
+  }
+  if (action === "set") {
+    const name = String(args[1] || "").trim();
+    const value = args.slice(2).join(" ").trim();
+    if (!name || !value) throw new Error("Usage: sub-bridge secrets set <name> <value>");
+    if (!Object.values(SecretName).includes(name)) {
+      throw new Error(`Unknown secret ${name}. Allowed: ${Object.values(SecretName).join(", ")}`);
+    }
+    saveSecret(SECRETS_DIR, name, value);
+    console.log(`stored encrypted secret ${name} in ${SECRETS_DIR}`);
+    return;
+  }
+  if (action === "unset") {
+    const name = String(args[1] || "").trim();
+    if (!name) throw new Error("Usage: sub-bridge secrets unset <name>");
+    if (!Object.values(SecretName).includes(name)) {
+      throw new Error(`Unknown secret ${name}. Allowed: ${Object.values(SecretName).join(", ")}`);
+    }
+    deleteSecret(SECRETS_DIR, name);
+    console.log(`removed secret ${name} from ${SECRETS_DIR}`);
+    return;
+  }
+  throw new Error("Usage: sub-bridge secrets <list|set|unset> ...");
 }
 
 function launchdDoctor() {
@@ -2610,6 +2570,7 @@ async function doctorCommand() {
       sqlite3: commandProbe("sqlite3", ["--version"]),
     },
     auth: providerDoctor.auth,
+    secrets: secretsDoctor(),
     macos: {
       launchd: launchdDoctor(),
     },
@@ -2699,8 +2660,8 @@ function loginCursor() {
   if (!token || !String(token).trim()) {
     throw new Error("Set SUB_BRIDGE_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN, then run cursor login again.");
   }
-  saveCursorAuthToken(token);
-  console.log(`stored cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+  saveSecret(SECRETS_DIR, SecretName.CURSOR_AUTH_TOKEN, token);
+  console.log(`stored encrypted cursor auth token in secrets vault (${SECRETS_DIR})`);
 }
 
 function loginCodex() {
@@ -2714,7 +2675,7 @@ function loginCommand() {
 
 function logoutCursor() {
   removeCursorAuthToken();
-  console.log(`removed cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+  console.log(`removed cursor auth token from secrets vault (${SECRETS_DIR})`);
 }
 
 function logoutCodex() {
@@ -3220,8 +3181,10 @@ function extractOutputTextFromSse(text) {
   let doneText = "";
   let deltaText = "";
   for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith("data: ")) continue;
-    const payload = line.slice(6).trim();
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let payload = trimmed;
+    if (payload.startsWith("data: ")) payload = payload.slice(6).trim();
     if (!payload || payload === "[DONE]") continue;
     try {
       const event = JSON.parse(payload);
@@ -3267,7 +3230,34 @@ function sqlQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-const COPILOT_CURSOR_TOOL_KINDS = ["execute", "search", "read", "edit", "delete", "move", "fetch", "tool"];
+const SUBBRIDGE_COPILOT_PROVIDER_PREFIX = "subbridge-";
+
+function repairCopilotWireApiSql({ providerId = null } = {}) {
+  const providerFilter = providerId
+    ? `id = ${sqlQuote(providerId)}`
+    : `id like ${sqlQuote(`${SUBBRIDGE_COPILOT_PROVIDER_PREFIX}%`)}`;
+  return `
+update model_providers
+set wire_api = 'completions',
+    settings_json = json_set(COALESCE(settings_json, '{}'), '$.wireApi', 'completions'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+where ${providerFilter};
+
+update provider_models
+set wire_api_override = null,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+where provider_id in (select id from model_providers where ${providerFilter});
+`;
+}
+
+function repairCopilotWireApi({ providerId = null } = {}) {
+  if (!existsSync(COPILOT_DB)) {
+    throw new Error(`Copilot database not found: ${COPILOT_DB}`);
+  }
+  execFileSync("sqlite3", [COPILOT_DB, repairCopilotWireApiSql({ providerId })], { stdio: "inherit" });
+}
+
+const COPILOT_CURSOR_TOOL_KINDS = ["execute", "search", "read", "edit", "delete", "move", "fetch", "tool", "plan", "question"];
 
 function copilotExtensionSource() {
   return `import { joinSession } from "@github/copilot-sdk/extension";
@@ -3283,14 +3273,37 @@ function formatToolResult(args) {
   if (typeof input.kind === "string" && input.kind) lines.push("kind: " + input.kind);
   if (typeof input.detail === "string" && input.detail) lines.push("detail: " + input.detail);
   if (typeof input.command === "string" && input.command) lines.push("command: " + input.command);
+  if (Array.isArray(input.steps) && input.steps.length > 0) {
+    lines.push("steps:");
+    for (const step of input.steps) {
+      const label = typeof step?.step === "string" ? step.step : "Step";
+      const status = typeof step?.status === "string" ? step.status : "pending";
+      lines.push("- [" + status + "] " + label);
+    }
+  }
+  if (typeof input.planMarkdown === "string" && input.planMarkdown.trim()) {
+    lines.push("plan:");
+    lines.push(input.planMarkdown.trim());
+  }
+  if (Array.isArray(input.questions) && input.questions.length > 0) {
+    lines.push("questions:");
+    for (const question of input.questions) {
+      const prompt = typeof question?.prompt === "string" ? question.prompt : "Question";
+      lines.push("- " + prompt);
+    }
+  }
   if (input.output !== undefined) lines.push("output: " + JSON.stringify(input.output));
   return lines.join("\\n");
 }
 
 function defineSubBridgeCursorTool(kind) {
+  const descriptions = {
+    plan: "Displays a Cursor plan or todo update forwarded by the SubBridge provider runtime.",
+    question: "Displays a Cursor ask-question prompt forwarded by the SubBridge provider runtime.",
+  };
   return {
     name: "subbridge_cursor_" + kind,
-    description: "Displays a Cursor ACP tool event that was executed by the SubBridge provider runtime.",
+    description: descriptions[kind] || "Displays a Cursor ACP tool event that was executed by the SubBridge provider runtime.",
     parameters: {
       type: "object",
       properties: {
@@ -3302,6 +3315,11 @@ function defineSubBridgeCursorTool(kind) {
         input: {},
         output: {},
         locations: {},
+        steps: {},
+        planMarkdown: { type: "string" },
+        questions: {},
+        answers: {},
+        source: { type: "string" },
       },
       additionalProperties: true,
     },
@@ -3333,7 +3351,7 @@ function installCopilot() {
 
   const settingsJson = JSON.stringify({
     baseUrl,
-    wireApi: "responses",
+    wireApi: "completions",
     azureApiVersion: null,
     authKind: "api_key",
     headers: {},
@@ -3343,16 +3361,19 @@ function installCopilot() {
 insert into model_providers
   (id, name, base_url, wire_api, azure_api_version, auth_kind, headers_json, type, settings_json)
 values
-  (${sqlQuote(PROVIDER_ID)}, ${sqlQuote(PROVIDER_NAME)}, ${sqlQuote(baseUrl)}, 'responses', null, 'api_key', '{}', 'custom', ${sqlQuote(settingsJson)})
+  (${sqlQuote(PROVIDER_ID)}, ${sqlQuote(PROVIDER_NAME)}, ${sqlQuote(baseUrl)}, 'completions', null, 'api_key', '{}', 'custom', ${sqlQuote(settingsJson)})
 on conflict(id) do update set
   name=excluded.name,
   base_url=excluded.base_url,
-  wire_api=excluded.wire_api,
+  wire_api='completions',
   azure_api_version=excluded.azure_api_version,
   auth_kind=excluded.auth_kind,
   headers_json=excluded.headers_json,
   type=excluded.type,
-  settings_json=excluded.settings_json,
+  settings_json=json_set(
+    json_set(COALESCE(model_providers.settings_json, '{}'), '$.wireApi', 'completions'),
+    '$.baseUrl', excluded.base_url
+  ),
   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
 `;
 
@@ -3364,7 +3385,7 @@ on conflict(id) do update set
 	insert into provider_models
 	  (id, provider_id, model_id, wire_model, display_name, max_prompt_tokens, max_output_tokens, wire_api_override)
 values
-  (${sqlQuote(id)}, ${sqlQuote(PROVIDER_ID)}, ${sqlQuote(model.id)}, ${sqlQuote(model.id)}, ${sqlQuote(model.displayName)}, ${model.contextWindow}, ${model.maxTokens}, 'responses')
+  (${sqlQuote(id)}, ${sqlQuote(PROVIDER_ID)}, ${sqlQuote(model.id)}, ${sqlQuote(model.id)}, ${sqlQuote(model.displayName)}, ${model.contextWindow}, ${model.maxTokens}, null)
 on conflict(id) do update set
   provider_id=excluded.provider_id,
   model_id=excluded.model_id,
@@ -3372,7 +3393,7 @@ on conflict(id) do update set
   display_name=excluded.display_name,
   max_prompt_tokens=excluded.max_prompt_tokens,
   max_output_tokens=excluded.max_output_tokens,
-  wire_api_override=excluded.wire_api_override,
+  wire_api_override=null,
   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
 `;
   }).join("\n");
@@ -3382,7 +3403,7 @@ on conflict(id) do update set
   installCopilotExtension();
   console.log(`installed provider ${PROVIDER_NAME}`);
   console.log(`baseUrl=${baseUrl}`);
-  console.log(`wireApi=responses`);
+  console.log(`wireApi=completions`);
   console.log(`backup=${backup}`);
 }
 
@@ -3422,6 +3443,10 @@ function installTarget(targetId = "copilot") {
     if (subscriptions.length === 0) throw new Error(`No subscriptions configured in ${CONFIG_PATH}`);
     console.log(`installing subscriptions: ${subscriptions.join(", ")}`);
     for (const subscription of subscriptions) installTargetForSubscription(subscription, targetId);
+    if (existsSync(COPILOT_DB)) {
+      repairCopilotWireApi();
+      console.log("repaired Copilot wire_api=completions for all SubBridge providers");
+    }
     return;
   }
 
@@ -3435,24 +3460,26 @@ function installTarget(targetId = "copilot") {
   target.install();
 }
 
-const args = GLOBAL_ARGS.args;
-const command = args[0] || "status";
-if (command === "serve") {
-  if (!SUB_NAME) throw new Error("Use --sub <name> serve");
-  startServer();
+export async function runCli() {
+  const args = GLOBAL_ARGS.args;
+  const command = args[0] || "status";
+  if (command === "serve") {
+    if (!SUB_NAME) throw new Error("Use --sub <name> serve");
+    startServer();
+  } else if (command === "start") await startCommand();
+  else if (command === "stop") stopCommand();
+  else if (command === "status") await statusCommand();
+  else if (command === "enable") await enableCommand();
+  else if (command === "login") loginCommand();
+  else if (command === "logout") logoutCommand();
+  else if (command === "doctor") await doctorCommand();
+  else if (command === "check" || command === "probe") await checkCommand();
+  else if (command === "models") modelsCommand();
+  else if (command === "config") await configCommand(args.slice(1));
+  else if (command === "secrets") secretsCommand(args.slice(1));
+  else if (command === "targets") targetsCommand();
+  else if (command === "install") installTarget(args[1]);
+  else if (command === "install-copilot") installTarget("copilot");
+  else if (command === "help" || command === "--help" || command === "-h") usage(0);
+  else usage(1);
 }
-else if (command === "start") await startCommand();
-else if (command === "stop") stopCommand();
-else if (command === "status") await statusCommand();
-else if (command === "enable") await enableCommand();
-else if (command === "login") loginCommand();
-else if (command === "logout") logoutCommand();
-else if (command === "doctor") await doctorCommand();
-else if (command === "check" || command === "probe") await checkCommand();
-else if (command === "models") modelsCommand();
-else if (command === "config") await configCommand(args.slice(1));
-else if (command === "targets") targetsCommand();
-else if (command === "install") installTarget(args[1]);
-else if (command === "install-copilot") installTarget("copilot");
-else if (command === "help" || command === "--help" || command === "-h") usage(0);
-else usage(1);

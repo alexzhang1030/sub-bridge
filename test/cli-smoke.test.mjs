@@ -2,28 +2,32 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
-import { responsesBodyToCursorPrompt, runCursorAcpTurn } from "../src/cursor-acp.js";
+import { responsesBodyToCursorPrompt, runCursorAcpTurn, shutdownCursorAcpRuntimes } from "../src/cursor-acp.ts";
 import {
   cursorOptionsFromModelEntry,
   filterCursorModelsByGroups,
   mergeCursorModelVariantsWithBaseControls,
   normalizeCursorModelVariantBaseId,
   resolveCursorAcpModelValue,
+  resolveReasoningEffortForModel,
+  validateCursorAcpModelValue,
   summarizeCursorModelGroups,
-} from "../src/cursor-models.js";
+} from "../src/cursor-models.ts";
 import {
   defaultProviderId,
   defaultProviderName,
   defaultProviderPort,
   defaultProviderTypeForSub,
   providerPluginForType,
-} from "../src/provider-plugins.js";
-import { isAbortLikeError, isRetryableTransientError } from "../src/errors.js";
+} from "../src/provider-plugins.ts";
+import { isAbortLikeError, isRetryableTransientError } from "../src/errors.ts";
+
+const disableCursorAcpPool = { SUB_BRIDGE_CURSOR_ACP_POOL: "0" };
 
 const root = new URL("..", import.meta.url).pathname;
-const cli = join(root, "src", "cli.js");
+const cli = join(root, "dist", "cli.mjs");
 const testConfig = join(root, `.tmp-config-${process.pid}.json`);
 
 function run(args, env = {}) {
@@ -271,13 +275,33 @@ async function waitForUrl(url, timeoutMs = 5000) {
 function parseSseTypes(text) {
   const types = [];
   for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith("data: ")) continue;
-    const payload = line.slice(6).trim();
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("event: ")) continue;
+    let payload = trimmed;
+    if (payload.startsWith("data: ")) payload = payload.slice(6).trim();
     if (!payload || payload === "[DONE]") continue;
     const event = JSON.parse(payload);
     if (event?.type) types.push(event.type);
   }
   return types;
+}
+
+function assertResponsesSseStream(text) {
+  const blocks = text.split(/\r?\n\r?\n/).map((block) => block.trim()).filter(Boolean);
+  assert.ok(blocks.length > 0, "expected at least one SSE event block");
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const dataLine = lines.find((line) => line.startsWith("data: "));
+    assert.ok(dataLine, `expected data: line in block ${block.slice(0, 80)}`);
+    const payload = dataLine.slice(6).trim();
+    assert.notEqual(payload, "[DONE]");
+    const event = JSON.parse(payload);
+    assert.equal(typeof event?.type, "string");
+    const eventLine = lines.find((line) => line.startsWith("event: "));
+    if (eventLine) {
+      assert.equal(event.type, eventLine.slice(7).trim());
+    }
+  }
 }
 
 test("provider plugins resolve defaults for cursor, codex, and custom subscriptions", () => {
@@ -345,7 +369,7 @@ test("stores subscription config separately with clean root keys", () => {
   assert.equal(cursor.file.subscriptions.cursor.type, "cursor-acp");
   assert.equal(cursor.effective.subscription, "cursor");
   assert.equal(cursor.effective.type, "cursor-acp");
-  assert.equal(cursor.effective.providerId, "codexsub-openai-codex");
+  assert.equal(cursor.effective.providerId, "subbridge-cursor");
   assert.equal(rootConfig.file.subscriptions.codex.type, "codex");
 });
 
@@ -606,6 +630,7 @@ test("cursor ACP sets requested model and per-model options", async () => {
       workspace: root,
       env: {
         ...process.env,
+        ...disableCursorAcpPool,
         MOCK_CAPTURE_PATH: capturePath,
       },
       timeoutMs: 5000,
@@ -657,6 +682,7 @@ test("cursor ACP config maps Composer fast model to supported ACP choice", async
       workspace: root,
       env: {
         ...process.env,
+        ...disableCursorAcpPool,
         MOCK_CAPTURE_PATH: capturePath,
       },
       timeoutMs: 5000,
@@ -670,6 +696,39 @@ test("cursor ACP config maps Composer fast model to supported ACP choice", async
       .split(/\n/)
       .map((line) => JSON.parse(line));
     assert.ok(writes.some((entry) => entry.configId === "model" && entry.value === "composer-2.5-fast"));
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor ACP skips reasoning config for Composer models", async () => {
+  const mock = createMockCursorAgent({
+    extraModelOptions: [{ value: "composer-2.5", name: "Composer 2.5" }],
+  });
+  const capturePath = join(mock.dir, "capture.jsonl");
+  try {
+    await runCursorAcpTurn({
+      command: mock.command,
+      workspace: root,
+      env: {
+        ...process.env,
+        ...disableCursorAcpPool,
+        MOCK_CAPTURE_PATH: capturePath,
+      },
+      timeoutMs: 5000,
+      model: "composer-2.5[fast=true]",
+      reasoningEffort: "xhigh",
+      modelOptions: { fastMode: true, reasoningEffort: "xhigh" },
+      body: { input: "hi" },
+    });
+
+    const writes = readFileSync(capturePath, "utf8")
+      .trim()
+      .split(/\n/)
+      .map((line) => JSON.parse(line));
+    assert.ok(writes.some((entry) => entry.configId === "model" && entry.value === "composer-2.5"));
+    assert.ok(writes.some((entry) => entry.configId === "fast" && entry.value === true));
+    assert.equal(writes.some((entry) => entry.configId === "effort"), false);
   } finally {
     rmSync(mock.dir, { recursive: true, force: true });
   }
@@ -856,6 +915,94 @@ test("cursor ACP resolves parameterized fast variants to CLI-style choices", () 
   );
 });
 
+test("cursor ACP builds parameterized slug when choices only expose base model", () => {
+  const configOptions = [{
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    options: [{ value: "composer-2.5", name: "Composer 2.5" }],
+  }];
+
+  assert.equal(
+    resolveCursorAcpModelValue(configOptions, "composer-2.5[fast=true]", { fastMode: true }),
+    "composer-2.5",
+  );
+});
+
+test("validateCursorAcpModelValue rejects unsupported composer reasoning slug", () => {
+  const configOptions = [{
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    options: [{ value: "composer-2.5", name: "Composer 2.5" }],
+  }];
+  assert.equal(
+    validateCursorAcpModelValue(configOptions, "composer-2.5[fast=true,reasoning=xhigh]"),
+    "Invalid params: Invalid model value: composer-2.5[fast=true,reasoning=xhigh]",
+  );
+  assert.equal(validateCursorAcpModelValue(configOptions, "composer-2.5[fast=true]"), null);
+  assert.equal(validateCursorAcpModelValue(configOptions, "composer-2.5"), null);
+});
+
+test("resolveReasoningEffortForModel skips unsupported models and honors defaults", () => {
+  assert.equal(
+    resolveReasoningEffortForModel({
+      id: "composer-2.5",
+      supportsFastMode: true,
+    }, "xhigh"),
+    undefined,
+  );
+  assert.equal(
+    resolveReasoningEffortForModel({
+      id: "claude-opus-4-8",
+      reasoningEffort: "off",
+    }, "xhigh"),
+    "off",
+  );
+  assert.equal(
+    resolveReasoningEffortForModel({
+      id: "gpt-5.5",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: [{ value: "medium", label: "Medium" }],
+    }, "xhigh"),
+    "medium",
+  );
+  assert.equal(
+    resolveReasoningEffortForModel({
+      id: "gpt-5.5",
+      supportedReasoningEfforts: [{ value: "high", label: "High", isDefault: true }],
+    }, "xhigh"),
+    "high",
+  );
+  assert.equal(
+    resolveReasoningEffortForModel({
+      id: "gpt-5.5",
+      supportedReasoningEfforts: [{ value: "high", label: "High" }],
+    }, "xhigh"),
+    "xhigh",
+  );
+});
+
+test("cursor ACP does not embed reasoning into composer slug from bridge config", () => {
+  const configOptions = [{
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    options: [{ value: "composer-2.5", name: "Composer 2.5" }],
+  }];
+
+  assert.equal(
+    resolveCursorAcpModelValue(configOptions, "composer-2.5[fast=true]", {
+      fastMode: true,
+      reasoningEffort: "xhigh",
+    }),
+    "composer-2.5",
+  );
+});
+
 test("cursor ACP surfaces reasoning, tool calls, and assistant events", async () => {
   const mock = createMockCursorAgent();
   try {
@@ -864,6 +1011,7 @@ test("cursor ACP surfaces reasoning, tool calls, and assistant events", async ()
       workspace: root,
       env: {
         ...process.env,
+        ...disableCursorAcpPool,
         MOCK_CURSOR_EVENTS: "1",
       },
       timeoutMs: 5000,
@@ -879,9 +1027,12 @@ test("cursor ACP surfaces reasoning, tool calls, and assistant events", async ()
       "tool_call",
       "tool_call",
       "content_delta",
+      "assistant_segment_completed",
     ]);
     assert.equal(result.events[0].streamKind, "reasoning_text");
     assert.equal(result.events[1].toolCall.kind, "execute");
+    assert.equal(result.events[1].toolCall.title, "Ran command");
+    assert.equal(result.events[1].toolCall.detail, "echo pong");
     assert.equal(result.events[2].toolCall.status, "completed");
     assert.equal(result.events[3].streamKind, "assistant_text");
   } finally {
@@ -906,6 +1057,8 @@ test("cursor bridge streams reasoning and assistant Responses events", async () 
       env: {
         ...process.env,
         SUB_BRIDGE_CONFIG: testConfig,
+        SUB_BRIDGE_SYNC_RESPONSES: "0",
+        ...disableCursorAcpPool,
         SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
         MOCK_CURSOR_EVENTS: "1",
       },
@@ -924,15 +1077,174 @@ test("cursor bridge streams reasoning and assistant Responses events", async () 
     });
     const text = await response.text();
     assert.equal(response.status, 200);
+    assertResponsesSseStream(text);
     const types = parseSseTypes(text);
+    assert.ok(types.includes("response.in_progress"));
+    assert.ok(text.includes('"sequence_number":1'));
     assert.ok(types.includes("response.reasoning_summary_text.delta"));
     assert.ok(types.includes("response.output_item.added"));
     assert.ok(types.includes("response.output_text.delta"));
     assert.ok(types.includes("response.completed"));
-    assert.equal(types.includes("response.function_call_arguments.delta"), false);
-    assert.equal(types.includes("response.function_call_arguments.done"), false);
-    assert.ok(text.includes("[cursor:execute:pending] Ran command - echo pong"));
-    assert.equal(text.includes('"name":"cursor_tool"'), false);
+    assert.ok(types.includes("response.function_call_arguments.delta"));
+    assert.ok(types.includes("response.function_call_arguments.done"));
+    assert.ok(text.includes('"name":"subbridge_cursor_execute"'));
+    assert.equal(text.includes("[cursor:execute:pending] Ran command - echo pong"), false);
+  } finally {
+    if (child && !child.killed) child.kill("SIGTERM");
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor bridge returns JSON when Copilot requests stream false", async () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  const port = String(25500 + (process.pid % 10000));
+  let child = null;
+  try {
+    assert.match(run(["--sub", "cursor-json", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor-json", "config", "set", "port", port]), /set port/);
+    assert.match(run(["--sub", "cursor-json", "config", "set", "models", JSON.stringify([
+      { id: "gpt-5.5", displayName: "GPT-5.5", contextWindow: 128000, maxTokens: 128000 },
+    ])]), /set models/);
+
+    child = spawn(process.execPath, [cli, "--sub", "cursor-json", "serve"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUB_BRIDGE_CONFIG: testConfig,
+        ...disableCursorAcpPool,
+        SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+        MOCK_CURSOR_EVENTS: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitForUrl(`http://127.0.0.1:${port}/v1/models`);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: false,
+        input: "Say pong.",
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /application\/json/);
+    const payload = JSON.parse(text);
+    assert.equal(payload.object, "response");
+    assert.equal(payload.status, "completed");
+    assert.ok(Array.isArray(payload.output));
+  } finally {
+    if (child && !child.killed) child.kill("SIGTERM");
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor bridge uses async SSE for Copilot native stream headers", async () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  const port = String(25200 + (process.pid % 10000));
+  let child = null;
+  try {
+    assert.match(run(["--sub", "cursor-async-sse", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor-async-sse", "config", "set", "port", port]), /set port/);
+    assert.match(run(["--sub", "cursor-async-sse", "config", "set", "models", JSON.stringify([
+      { id: "gpt-5.5", displayName: "GPT-5.5", contextWindow: 128000, maxTokens: 128000 },
+    ])]), /set models/);
+
+    child = spawn(process.execPath, [cli, "--sub", "cursor-async-sse", "serve"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUB_BRIDGE_CONFIG: testConfig,
+        SUB_BRIDGE_SYNC_RESPONSES: "0",
+        ...disableCursorAcpPool,
+        SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+        MOCK_CURSOR_EVENTS: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitForUrl(`http://127.0.0.1:${port}/v1/models`);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        "x-stainless-helper-method": "stream",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: "Say pong.",
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+    assertResponsesSseStream(text);
+    const types = parseSseTypes(text);
+    assert.ok(types.includes("response.created"));
+    assert.ok(types.includes("response.in_progress"));
+    assert.ok(types.includes("response.completed"));
+    assert.equal(text.includes("event: "), false);
+  } finally {
+    if (child && !child.killed) child.kill("SIGTERM");
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor bridge returns JSON with visible assistant text on Cursor ACP errors", async () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  const port = String(26500 + (process.pid % 10000));
+  let child = null;
+  try {
+    assert.match(run(["--sub", "cursor-json-error", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor-json-error", "config", "set", "port", port]), /set port/);
+    assert.match(run(["--sub", "cursor-json-error", "config", "set", "models", JSON.stringify([
+      { id: "composer-2.5[fast=true]", displayName: "Composer 2.5 Fast", contextWindow: 128000, maxTokens: 128000 },
+    ])]), /set models/);
+
+    child = spawn(process.execPath, [cli, "--sub", "cursor-json-error", "serve"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUB_BRIDGE_CONFIG: testConfig,
+        ...disableCursorAcpPool,
+        SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+        MOCK_CURSOR_PROMPT_ERROR: "Invalid params: Invalid model value: composer-2.5",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitForUrl(`http://127.0.0.1:${port}/v1/models`);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: "composer-2.5[fast=true]",
+        stream: false,
+        input: "你好",
+      }),
+    });
+    const text = await response.text();
+    const payload = JSON.parse(text);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /application\/json/);
+    assert.equal(payload.status, "completed");
+    assert.ok(payload.output.some((item) =>
+      item.type === "message" &&
+      item.content?.some((part) => String(part.text || "").includes("Cursor ACP error: Invalid params: Invalid model value: composer-2.5")),
+    ));
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });
@@ -956,6 +1268,8 @@ test("cursor bridge completes stream with visible assistant text on Cursor ACP e
       env: {
         ...process.env,
         SUB_BRIDGE_CONFIG: testConfig,
+        SUB_BRIDGE_SYNC_RESPONSES: "0",
+        ...disableCursorAcpPool,
         SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
         MOCK_CURSOR_PROMPT_ERROR: "Invalid params: Invalid model value: composer-2.5",
       },
@@ -979,7 +1293,6 @@ test("cursor bridge completes stream with visible assistant text on Cursor ACP e
     assert.ok(types.includes("response.output_text.delta"));
     assert.ok(types.includes("response.completed"));
     assert.ok(text.includes("Cursor ACP error: Invalid params: Invalid model value: composer-2.5"));
-    assert.ok(text.includes("data: [DONE]"));
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });
@@ -1043,13 +1356,19 @@ create table provider_models (
       SUB_BRIDGE_COPILOT_DB: dbPath,
       SUB_BRIDGE_COPILOT_EXTENSION_DIR: extensionDir,
     });
-    assert.match(output, /installed provider SubBridge/);
+    assert.match(output, /installed provider SubBridge Cursor/);
     const extension = readFileSync(join(extensionDir, "extension.mjs"), "utf8");
     assert.ok(extension.includes('"execute"'));
     assert.ok(extension.includes('"subbridge_cursor_" + kind'));
     assert.ok(extension.includes("joinSession"));
-    const count = execFileSync("sqlite3", [dbPath, "select count(*) from provider_models where provider_id='codexsub-openai-codex';"], { encoding: "utf8" }).trim();
+    const count = execFileSync("sqlite3", [dbPath, "select count(*) from provider_models where provider_id='subbridge-cursor';"], { encoding: "utf8" }).trim();
     assert.notEqual(count, "0");
+    const providerRow = execFileSync("sqlite3", ["-separator", "\t", dbPath, "select wire_api, settings_json from model_providers where id='subbridge-cursor';"], { encoding: "utf8" }).trim();
+    const [wireApi, settingsJson] = providerRow.split("\t");
+    assert.equal(wireApi, "completions");
+    assert.equal(JSON.parse(settingsJson).wireApi, "completions");
+    const modelWireApi = execFileSync("sqlite3", [dbPath, "select distinct coalesce(wire_api_override, '') from provider_models where provider_id='subbridge-cursor';"], { encoding: "utf8" }).trim();
+    assert.equal(modelWireApi, "");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1149,17 +1468,18 @@ test("cursor login stores encrypted local token", () => {
     assert.match(run(["--sub", "cursor", "login"], {
       ...runtimeEnv,
       SUB_BRIDGE_CURSOR_AUTH_TOKEN: token,
-    }), /stored cursor auth token/);
-    const tokenPath = join(authDir, "token.enc");
-    assert.equal(existsSync(tokenPath), true);
-    assert.equal(readFileSync(tokenPath, "utf8").includes(token), false);
+    }), /stored encrypted cursor auth token/);
+    const vaultPath = join(authDir, "vault.enc");
+    assert.equal(existsSync(vaultPath), true);
+    assert.equal(readFileSync(vaultPath, "utf8").includes(token), false);
     const doctor = JSON.parse(run(["--sub", "cursor", "doctor"], {
       ...runtimeEnv,
       SUB_BRIDGE_CURSOR_ACP_COMMAND: "__missing_cursor_agent__",
     }));
-    assert.equal(doctor.auth.cursor.local.tokenExists, true);
+    assert.equal(doctor.auth.cursor.local.tokenConfigured, true);
+    assert.equal(doctor.secrets.cursorAuthToken.configured, true);
     run(["--sub", "cursor", "logout"], runtimeEnv);
-    assert.equal(existsSync(tokenPath), false);
+    assert.equal(existsSync(vaultPath), false);
   } finally {
     rmSync(authDir, { recursive: true, force: true });
     rmSync(stateDir, { recursive: true, force: true });

@@ -7,6 +7,7 @@ Usage: ./install.sh [options]
 
 Installs sub-bridge into ~/.local/bin, configures cursor/codex subscriptions,
 and refreshes GitHub Copilot provider rows when ~/.copilot/data.db exists.
+Copilot providers are installed with wire_api=completions by default (/v1/chat/completions).
 
 Options:
   --prefix DIR       Install command into DIR/bin (default: ~/.local)
@@ -77,17 +78,28 @@ require_command() {
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 bin_dir="$prefix/bin"
+lib_dir="$prefix/lib/sub-bridge"
 install_bin="$bin_dir/sub-bridge"
 config_path="${SUB_BRIDGE_CONFIG:-$HOME/.config/sub-bridge/config.json}"
 copilot_db="${SUB_BRIDGE_COPILOT_DB:-$HOME/.copilot/data.db}"
 
 require_command node
-require_command npm
 
 node -e 'const major = Number(process.versions.node.split(".")[0]); if (major < 20) { console.error(`Node >=20 required, found ${process.version}`); process.exit(1); }'
 
 cd "$script_dir"
-npm ci
+if [ -f "$script_dir/dist/cli.mjs" ] && [ "${SUB_BRIDGE_INSTALL_SKIP_BUILD:-0}" = "1" ]; then
+  echo "using existing dist (SUB_BRIDGE_INSTALL_SKIP_BUILD=1)"
+else
+  require_command npm
+  npm ci
+  npm run build
+fi
+
+if [ ! -f "$script_dir/dist/cli.mjs" ]; then
+  echo "missing build output: $script_dir/dist/cli.mjs" >&2
+  exit 1
+fi
 
 xml_escape() {
   printf '%s' "$1" | sed \
@@ -110,7 +122,7 @@ write_launch_agent() {
   escaped_label="$(xml_escape "$label")"
   escaped_bin="$(xml_escape "$install_bin")"
   escaped_sub="$(xml_escape "$sub")"
-  escaped_workdir="$(xml_escape "$script_dir")"
+  escaped_workdir="$(xml_escape "$lib_dir")"
   escaped_home="$(xml_escape "$HOME")"
   escaped_path="$(xml_escape "${PATH:-/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin}")"
   escaped_stdout="$(xml_escape "$logs_dir/$label.out.log")"
@@ -153,6 +165,22 @@ PLIST
 
   chmod 0644 "$plist_path"
   echo "launch agent: $plist_path"
+}
+
+config_get() {
+  sub="$1"
+  key="$2"
+  "$install_bin" --sub "$sub" config get "$key" 2>/dev/null | tr -d '"[:space:]' || true
+}
+
+set_subscription_default() {
+  sub="$1"
+  key="$2"
+  value="$3"
+  current="$(config_get "$sub" "$key")"
+  if [ -z "$current" ] || [ "$current" = "null" ]; then
+    "$install_bin" --sub "$sub" config set "$key" "$value"
+  fi
 }
 
 load_launch_agent() {
@@ -223,10 +251,15 @@ load_launch_agent() {
   return 1
 }
 
-mkdir -p "$bin_dir"
+mkdir -p "$bin_dir" "$lib_dir/dist"
+cp "$script_dir/dist/cli.mjs" "$lib_dir/dist/cli.mjs"
+if [ -f "$script_dir/dist/cli.mjs.map" ]; then
+  cp "$script_dir/dist/cli.mjs.map" "$lib_dir/dist/cli.mjs.map"
+fi
+cp "$script_dir/package.json" "$lib_dir/package.json"
 {
   echo '#!/usr/bin/env bash'
-  printf 'exec node %q "$@"\n' "$script_dir/src/cli.js"
+  printf 'exec node %q "$@"\n' "$lib_dir/dist/cli.mjs"
 } > "$install_bin"
 chmod 0755 "$install_bin"
 
@@ -235,16 +268,16 @@ if [ ! -f "$config_path" ]; then
 fi
 
 if [ "$configure_subscriptions" -eq 1 ]; then
-  "$install_bin" --sub cursor config set type cursor-acp
-  "$install_bin" --sub cursor config set port 17876
-  "$install_bin" --sub cursor config set providerId codexsub-openai-codex
-  "$install_bin" --sub cursor config set providerName SubBridge
+  set_subscription_default cursor type cursor-acp
+  set_subscription_default cursor port 17876
+  set_subscription_default cursor providerId subbridge-cursor
+  set_subscription_default cursor providerName "SubBridge Cursor"
   "$install_bin" --sub cursor config init
 
-  "$install_bin" --sub codex config set type codex
-  "$install_bin" --sub codex config set port 17877
-  "$install_bin" --sub codex config set providerId subbridge-codex
-  "$install_bin" --sub codex config set providerName "SubBridge Codex"
+  set_subscription_default codex type codex
+  set_subscription_default codex port 17877
+  set_subscription_default codex providerId subbridge-codex
+  set_subscription_default codex providerName "SubBridge Codex"
   "$install_bin" --sub codex config init
 
   if [ "$install_copilot" -eq 1 ]; then
@@ -280,4 +313,5 @@ else
 fi
 
 echo "installed: $install_bin"
+echo "runtime: $lib_dir/dist/cli.mjs"
 echo "config: $config_path"

@@ -34,7 +34,7 @@ cursor_keys="$(HOME="$tmp_home" "$installed_bin" --sub cursor config show | node
 test "$root_keys" = '$schema,version,subscriptions'
 test "$cursor_type" = '"cursor-acp"'
 test "$codex_type" = '"codex"'
-test "$cursor_provider_id" = '"codexsub-openai-codex"'
+test "$cursor_provider_id" = '"subbridge-cursor"'
 test "$codex_provider_id" = '"subbridge-codex"'
 test "$cursor_keys" = 'type,host,port,models,providerId,providerName'
 

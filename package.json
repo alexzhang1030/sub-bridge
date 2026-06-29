@@ -1,6 +1,6 @@
 {
   "name": "sub-bridge-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "description": "Local OpenAI Responses bridge for subscription-backed coding agents.",
@@ -8,13 +8,22 @@
     "sub-bridge": "./bin/sub-bridge"
   },
   "scripts": {
-    "check": "node --check bin/sub-bridge && node --check src/cli.js && node --check src/cursor-acp.js && node --check src/cursor-models.js && node --check src/cursor-runtime.js && node --check src/errors.js && node --check src/provider-plugins.js",
-    "ci": "npm run check && bash -n install.sh && bash -n scripts/test-install.sh && npm test && npm run test:install && npm run smoke",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "check": "tsc --noEmit -p tsconfig.app.json && npm run build && node --check dist/cli.mjs",
+    "ci": "npm run build && npm run check && bash -n install.sh && bash -n uninstall.sh && bash -n scripts/test-install.sh && npm test && npm run test:install && npm run smoke",
     "test:install": "bash scripts/test-install.sh",
-    "test": "node --test",
-    "smoke": "node src/cli.js --help && node src/cli.js targets && node src/cli.js models"
+    "test": "vitest run",
+    "smoke": "node dist/cli.mjs --help && node dist/cli.mjs targets && node dist/cli.mjs models"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "tsdown": "^0.21.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   }
 }

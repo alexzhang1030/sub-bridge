@@ -1,22 +1,24 @@
-function messageFromUnknown(error) {
+function messageFromUnknown(error: unknown): string {
   if (typeof error === "string") return error;
   if (error && typeof error === "object") {
-    if (typeof error.message === "string") return error.message;
-    if (typeof error.errorMessage === "string") return error.errorMessage;
+    const record = error as Record<string, unknown>;
+    if (typeof record.message === "string") return record.message;
+    if (typeof record.errorMessage === "string") return record.errorMessage;
   }
   return String(error || "");
 }
 
-export function errorMessage(error) {
+export function errorMessage(error: unknown): string {
   return messageFromUnknown(error);
 }
 
-export function isAbortLikeError(error) {
+export function isAbortLikeError(error: unknown): boolean {
   const message = messageFromUnknown(error).toLowerCase();
   if (error && typeof error === "object") {
-    if (error.name === "AbortError") return true;
-    if (error.code === "ABORT_ERR") return true;
-    if (isAbortLikeError(error.cause)) return true;
+    const record = error as Record<string, unknown> & { cause?: unknown };
+    if (record.name === "AbortError") return true;
+    if (record.code === "ABORT_ERR") return true;
+    if (isAbortLikeError(record.cause)) return true;
   }
   return (
     message.includes("request was aborted") ||
@@ -29,10 +31,12 @@ export function isAbortLikeError(error) {
   );
 }
 
-export function isRetryableTransientError(error) {
+export function isRetryableTransientError(error: unknown): boolean {
   if (isAbortLikeError(error)) return false;
   const message = messageFromUnknown(error).toLowerCase();
-  if (error && typeof error === "object" && isRetryableTransientError(error.cause)) return true;
+  if (error && typeof error === "object" && isRetryableTransientError((error as { cause?: unknown }).cause)) {
+    return true;
+  }
   return (
     message.includes("fetch failed") ||
     message.includes("socket hang up") ||

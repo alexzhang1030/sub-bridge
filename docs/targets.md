@@ -20,8 +20,8 @@ Runtime responsibilities:
 - model id normalization
 - OpenAI Responses request normalization
 - Pi wrapper forwarding
-- SSE for `stream:true`
-- JSON response for `stream:false`
+- SSE for `stream:true` (Copilot sync SSE)
+- JSON response for `stream:false` (Copilot JSON client path)
 - config file loading from `~/.config/sub-bridge/config.json`
 - profile selection through `--profile <name>` or `SUB_BRIDGE_PROFILE`
 
@@ -64,7 +64,7 @@ Cursor ACP settings:
 Profiles support multiple running bridge instances from one config file:
 
 ```text
-Copilot App -> SubBridge        -> http://127.0.0.1:17876/v1 -> backend=cursor-acp
+Copilot App -> SubBridge Cursor -> http://127.0.0.1:17876/v1 -> backend=cursor-acp
 Copilot App -> SubBridge Codex  -> http://127.0.0.1:17877/v1 -> backend=codex
 ```
 
