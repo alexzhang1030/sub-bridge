@@ -30,16 +30,26 @@ function run(args, env = {}) {
   });
 }
 
-function createMockCursorAgent({ failMemoryAuth = false, availableModels = true } = {}) {
+function createMockCursorAgent({ failMemoryAuth = false, availableModels = true, cliModels = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "sub-bridge-cursor-agent-"));
   const command = join(dir, "agent.mjs");
   writeFileSync(command, `#!/usr/bin/env node
 import readline from "node:readline";
 import { appendFileSync } from "node:fs";
 
-if (process.argv[2] !== "acp") process.exit(2);
 const failMemoryAuth = ${JSON.stringify(failMemoryAuth)};
 const availableModels = ${JSON.stringify(availableModels)};
+const cliModels = ${JSON.stringify(cliModels)};
+const args = process.argv.slice(2);
+if (args.includes("models")) {
+  if (process.env.MOCK_CLI_ARGS_PATH) {
+    appendFileSync(process.env.MOCK_CLI_ARGS_PATH, JSON.stringify(args) + "\\n");
+  }
+  if (cliModels.length === 0) process.exit(2);
+  process.stdout.write(cliModels.join("\\n") + "\\n");
+  process.exit(0);
+}
+if (!args.includes("acp")) process.exit(2);
 
 const modelConfigOptions = [
   {
@@ -417,6 +427,48 @@ test("cursor init fetches models from ACP available models", () => {
   }
 });
 
+test("cursor init merges ACP model metadata with CLI-only models", () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent({
+    cliModels: [
+      "gpt-5.5 - GPT-5.5 CLI",
+      "cursor-cli-only - Cursor CLI Only",
+    ],
+  });
+  const cliArgsPath = join(mock.dir, "cli-args.jsonl");
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      MOCK_CLI_ARGS_PATH: cliArgsPath,
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+      SUB_BRIDGE_CURSOR_API_ENDPOINT: "https://cursor.example.test",
+    }), /wrote/);
+
+    const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+    assert.deepEqual(cursor.file.subscriptions.cursor.models.map((model) => model.id), [
+      "gpt-5.5",
+      "claude-haiku-4-5",
+      "cursor-cli-only",
+    ]);
+    const gpt = cursor.file.subscriptions.cursor.models.find((model) => model.id === "gpt-5.5");
+    assert.equal(gpt.displayName, "GPT-5.5");
+    assert.equal(gpt.contextWindow, 272000);
+    assert.equal(gpt.defaultContextWindow, "272k");
+    assert.equal(gpt.defaultReasoningEffort, "medium");
+    assert.deepEqual(gpt.supportedReasoningEfforts.map((entry) => entry.value), ["low", "medium", "high"]);
+    const cliOnly = cursor.file.subscriptions.cursor.models.find((model) => model.id === "cursor-cli-only");
+    assert.equal(cliOnly.displayName, "Cursor CLI Only");
+
+    const cliArgs = readFileSync(cliArgsPath, "utf8")
+      .trim()
+      .split(/\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(cliArgs.at(-1), ["-e", "https://cursor.example.test", "models"]);
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
 test("cursor init falls back to agent auth for model discovery", () => {
   rmSync(testConfig, { force: true });
   const mock = createMockCursorAgent({ failMemoryAuth: true });
@@ -547,7 +599,7 @@ test("cursor ACP surfaces reasoning, tool calls, and assistant events", async ()
   }
 });
 
-test("cursor bridge streams reasoning and tool call Responses events", async () => {
+test("cursor bridge streams reasoning and assistant Responses events", async () => {
   rmSync(testConfig, { force: true });
   const mock = createMockCursorAgent();
   const port = String(25000 + (process.pid % 10000));
@@ -584,10 +636,10 @@ test("cursor bridge streams reasoning and tool call Responses events", async () 
     assert.equal(response.status, 200);
     const types = parseSseTypes(text);
     assert.ok(types.includes("response.reasoning_summary_text.delta"));
-    assert.ok(types.includes("response.function_call_arguments.delta"));
-    assert.ok(types.includes("response.function_call_arguments.done"));
     assert.ok(types.includes("response.output_text.delta"));
     assert.ok(types.includes("response.completed"));
+    assert.equal(types.includes("response.function_call_arguments.delta"), false);
+    assert.equal(text.includes('"name":"cursor_tool"'), false);
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });

@@ -574,10 +574,10 @@ function cursorLocalEnvDirs() {
   };
 }
 
-function makeBridgeCursorEnv({ includeToken = true } = {}) {
+function makeBridgeCursorEnv({ includeToken = true, forceCi = CURSOR_FORCE_CI } = {}) {
   const dirs = cursorLocalEnvDirs();
   for (const path of Object.values(dirs)) ensurePrivateDir(path);
-  const env = makeCursorEnv({ forceCi: CURSOR_FORCE_CI });
+  const env = makeCursorEnv({ forceCi });
   env.AGENT_CLI_CREDENTIAL_STORE = "memory";
   env.CURSOR_CONFIG_DIR = dirs.configDir;
   env.CURSOR_DATA_DIR = dirs.dataDir;
@@ -589,10 +589,10 @@ function makeBridgeCursorEnv({ includeToken = true } = {}) {
   return env;
 }
 
-function makeCursorRuntimeEnv() {
+function makeCursorRuntimeEnv({ forceCi = CURSOR_FORCE_CI } = {}) {
   return cursorAuthTokenPresent()
-    ? makeBridgeCursorEnv()
-    : makeCursorEnv({ forceCi: CURSOR_FORCE_CI });
+    ? makeBridgeCursorEnv({ forceCi })
+    : makeCursorEnv({ forceCi });
 }
 
 function decodeBase64Url(value) {
@@ -1092,7 +1092,7 @@ async function collectPiResponse({ provider, model, context, token, sessionId, b
   };
 }
 
-function normalizeRequestBody(bodyText) {
+function normalizeRequestBody(bodyText, { stripTools = STRIP_COPILOT_TOOLS } = {}) {
   let body;
   if (!bodyText.trim()) {
     body = {
@@ -1130,7 +1130,7 @@ function normalizeRequestBody(bodyText) {
 
   const toolsIn = Array.isArray(body.tools) ? body.tools.length : 0;
   let strippedTools = false;
-  if (STRIP_COPILOT_TOOLS && toolsIn > 0) {
+  if (stripTools && toolsIn > 0) {
     delete body.tools;
     delete body.tool_choice;
     delete body.parallel_tool_calls;
@@ -1624,14 +1624,6 @@ function safeToolIdentifier(value, fallback = "tool") {
   return normalized || fallback;
 }
 
-function cursorToolItemIds(toolCall) {
-  const suffix = safeToolIdentifier(toolCall?.id || randomUUID(), "tool");
-  return {
-    itemId: `fc_cursor_${suffix}`,
-    callId: `call_cursor_${suffix}`,
-  };
-}
-
 function cursorToolName(toolCall) {
   return `cursor_${safeToolIdentifier(toolCall?.kind || "tool", "tool")}`;
 }
@@ -1649,14 +1641,9 @@ function cursorToolArguments(toolCall) {
   });
 }
 
-function cursorToolStatusIsTerminal(status) {
-  return status === "completed" || status === "failed";
-}
-
 function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
   let reasoningText = "";
   let assistantText = "";
-  const tools = new Map();
 
   for (const event of Array.isArray(events) ? events : []) {
     if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
@@ -1668,20 +1655,7 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       continue;
     }
     if (event.type === "tool_call") {
-      const ids = cursorToolItemIds(event.toolCall);
-      const existing = tools.get(event.toolCall.id);
-      const item = existing || {
-        id: ids.itemId,
-        type: "function_call",
-        call_id: ids.callId,
-        name: cursorToolName(event.toolCall),
-        arguments: "",
-        status: "in_progress",
-      };
-      item.name = cursorToolName(event.toolCall);
-      item.arguments = cursorToolArguments(event.toolCall);
-      if (cursorToolStatusIsTerminal(event.toolCall.status)) item.status = "completed";
-      tools.set(event.toolCall.id, item);
+      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(event.toolCall)));
     }
   }
 
@@ -1693,7 +1667,6 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       summary: [{ type: "summary_text", text: reasoningText }],
     });
   }
-  output.push(...tools.values());
   const finalText = assistantText || fallbackText;
   if (finalText) {
     output.push({
@@ -1708,7 +1681,7 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
 
 async function forwardResponsesCursorAcp(req, res, bodyText) {
   const startedAt = Date.now();
-  const normalized = normalizeRequestBody(bodyText);
+  const normalized = normalizeRequestBody(bodyText, { stripTools: true });
   const body = JSON.parse(normalized.body);
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
   const output = [];
@@ -1801,7 +1774,6 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   let nextOutputIndex = 0;
   let assistantEntry = null;
   let reasoningEntry = null;
-  const toolEntries = new Map();
 
   const addOutputItem = (item) => {
     const outputIndex = nextOutputIndex;
@@ -1896,60 +1868,6 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     reasoningEntry = null;
   };
 
-  const applyToolCallEvent = (toolCall) => {
-    finishAssistantEntry();
-    finishReasoningEntry();
-    const ids = cursorToolItemIds(toolCall);
-    const name = cursorToolName(toolCall);
-    const args = cursorToolArguments(toolCall);
-    let entry = toolEntries.get(toolCall.id);
-    if (!entry) {
-      const item = {
-        id: ids.itemId,
-        type: "function_call",
-        call_id: ids.callId,
-        name,
-        arguments: "",
-        status: "in_progress",
-      };
-      const outputIndex = addOutputItem(item);
-      entry = { item, outputIndex, argumentsWritten: false };
-      toolEntries.set(toolCall.id, entry);
-      recordWrite("response.function_call_arguments.delta", {
-        item_id: item.id,
-        output_index: outputIndex,
-        delta: args,
-      });
-      entry.argumentsWritten = true;
-    }
-    entry.item.name = name;
-    entry.item.arguments = args;
-    if (cursorToolStatusIsTerminal(toolCall.status) && entry.item.status !== "completed") {
-      entry.item.status = "completed";
-      recordWrite("response.function_call_arguments.done", {
-        item_id: entry.item.id,
-        output_index: entry.outputIndex,
-        name,
-        arguments: args,
-      });
-      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
-    }
-  };
-
-  const finishOpenToolEntries = () => {
-    for (const entry of toolEntries.values()) {
-      if (entry.item.status === "completed") continue;
-      entry.item.status = "completed";
-      recordWrite("response.function_call_arguments.done", {
-        item_id: entry.item.id,
-        output_index: entry.outputIndex,
-        name: entry.item.name,
-        arguments: entry.item.arguments,
-      });
-      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
-    }
-  };
-
   const applyCursorEvent = (event) => {
     if (event.type === "content_delta" && event.streamKind === "assistant_text") {
       const entry = ensureAssistantEntry();
@@ -1976,7 +1894,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       return;
     }
     if (event.type === "tool_call") {
-      applyToolCallEvent(event.toolCall);
+      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(event.toolCall)));
     }
   };
 
@@ -1988,7 +1906,6 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     });
     finishReasoningEntry();
     finishAssistantEntry();
-    finishOpenToolEntries();
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
@@ -2013,7 +1930,6 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     const message = error instanceof Error ? error.message : String(error);
     finishReasoningEntry();
     finishAssistantEntry();
-    finishOpenToolEntries();
     recordWrite("response.failed", {
       response: responseObject({
         id: responseId,
@@ -2595,6 +2511,27 @@ function mergeFetchedModels(fetchedModels, configuredModels) {
   });
 }
 
+function mergeCursorDiscoveredModels(primaryModels, additionalModels) {
+  const seen = new Set();
+  const merged = [];
+  for (const model of [...normalizeModelList(primaryModels), ...normalizeModelList(additionalModels)]) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    merged.push(model);
+  }
+  return merged;
+}
+
+function mergeCursorCliModelSnapshot(snapshot) {
+  const cliSnapshot = fetchCursorModelCommandSnapshot();
+  if (cliSnapshot.source === "builtin") return snapshot;
+  return {
+    ...snapshot,
+    source: `${snapshot.source}+${cliSnapshot.source}`,
+    models: mergeCursorDiscoveredModels(snapshot.models, cliSnapshot.models),
+  };
+}
+
 async function fetchCursorModelSnapshot() {
   if (OFFLINE_DISCOVERY) {
     return { models: BUILTIN_MODELS, source: "builtin", offline: true };
@@ -2614,13 +2551,13 @@ async function fetchCursorModelSnapshot() {
   };
 
   try {
-    const snapshot = await fetchViaAcp(makeBridgeCursorEnv(), "cursor-acp-local-auth");
-    if (snapshot) return snapshot;
+    const snapshot = await fetchViaAcp(makeBridgeCursorEnv({ forceCi: true }), "cursor-acp-local-auth");
+    if (snapshot) return mergeCursorCliModelSnapshot(snapshot);
   } catch {}
 
   try {
-    const snapshot = await fetchViaAcp(makeCursorEnv({ forceCi: CURSOR_FORCE_CI }), "cursor-acp-agent-auth");
-    if (snapshot) return snapshot;
+    const snapshot = await fetchViaAcp(makeCursorEnv({ forceCi: true }), "cursor-acp-agent-auth");
+    if (snapshot) return mergeCursorCliModelSnapshot(snapshot);
   } catch (error) {
     const fallback = fetchCursorModelCommandSnapshot();
     if (fallback.source !== "builtin") return fallback;
@@ -2634,10 +2571,14 @@ async function fetchCursorModelSnapshot() {
 }
 
 function fetchCursorModelCommandSnapshot() {
-  const result = spawnSync(CURSOR_ACP_COMMAND, ["models"], {
+  const args = [
+    ...(CURSOR_API_ENDPOINT ? ["-e", CURSOR_API_ENDPOINT] : []),
+    "models",
+  ];
+  const result = spawnSync(CURSOR_ACP_COMMAND, args, {
     encoding: "utf8",
     timeout: 8000,
-    env: makeCursorRuntimeEnv(),
+    env: makeCursorRuntimeEnv({ forceCi: true }),
   });
   const models = normalizeModelList(parseCursorCliModelList(result.stdout));
   if (result.status === 0 && models.length > 0) {
