@@ -23,6 +23,7 @@ Runtime responsibilities:
 - SSE for `stream:true`
 - JSON response for `stream:false`
 - config file loading from `~/.config/sub-bridge/config.json`
+- profile selection through `--profile <name>` or `SUB_BRIDGE_PROFILE`
 
 ## Targets
 
@@ -33,7 +34,7 @@ Targets own local app configuration.
 | `copilot` | supported | Write GitHub Copilot custom provider rows into `~/.copilot/data.db`. |
 | `cursor` | planned | Add Cursor app provider configuration once its local provider storage format is mapped. |
 
-Target adapters should only write app-specific settings and should reuse the same bridge base URL:
+Target adapters should write app-specific settings against the active profile's bridge base URL:
 
 ```text
 http://127.0.0.1:17876/v1
@@ -57,3 +58,14 @@ Cursor ACP settings:
   "cursorModel": "default"
 }
 ```
+
+## Profiles
+
+Profiles support multiple running bridge instances from one config file:
+
+```text
+Copilot App -> SubBridge        -> http://127.0.0.1:17876/v1 -> backend=cursor-acp
+Copilot App -> SubBridge Codex  -> http://127.0.0.1:17877/v1 -> backend=codex
+```
+
+Each profile should define a unique `port`, `providerId`, and state directory. The default state directory becomes `~/.local/state/sub-bridge-cli/<profile>` when a profile is active.

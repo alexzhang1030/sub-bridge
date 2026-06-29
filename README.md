@@ -7,6 +7,7 @@ The production target is GitHub Copilot custom providers. The bridge can route C
 ## Commands
 
 ```bash
+sub-bridge --profile cursor status
 sub-bridge status
 sub-bridge login
 sub-bridge logout
@@ -65,8 +66,45 @@ Useful commands:
 ```bash
 sub-bridge config path
 sub-bridge config show
+sub-bridge --profile cursor config show
 sub-bridge config set reasoningEffort max
+sub-bridge --profile cursor config set backend cursor-acp
 sub-bridge config unset reasoningEffort
+```
+
+## Profiles
+
+Profiles let multiple bridge instances run at the same time from one config file. Each profile gets its own effective config, pid file, log file, port, and Copilot provider id.
+
+```json
+{
+  "profiles": {
+    "cursor": {
+      "port": 17876,
+      "backend": "cursor-acp",
+      "providerId": "codexsub-openai-codex",
+      "providerName": "SubBridge",
+      "cursorAcpCommand": "/Users/alex/.local/bin/agent",
+      "cursorWorkspace": "/absolute/path/to/project",
+      "cursorModel": "default"
+    },
+    "codex": {
+      "port": 17877,
+      "backend": "codex",
+      "providerId": "subbridge-codex",
+      "providerName": "SubBridge Codex"
+    }
+  }
+}
+```
+
+```bash
+sub-bridge --profile cursor start
+sub-bridge --profile codex start
+sub-bridge --profile cursor install copilot
+sub-bridge --profile codex install copilot
+sub-bridge --profile cursor status
+sub-bridge --profile codex status
 ```
 
 ## Environment Overrides
@@ -75,6 +113,7 @@ Environment variables override config file values. Use them for one-off runs and
 
 ```bash
 SUB_BRIDGE_CONFIG=~/.config/sub-bridge/config.json
+SUB_BRIDGE_PROFILE=cursor
 SUB_BRIDGE_HOST=127.0.0.1
 SUB_BRIDGE_PORT=17876
 SUB_BRIDGE_MODEL=gpt-5.5

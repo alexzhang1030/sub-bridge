@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -31,6 +32,46 @@ function envValue(...keys) {
   return undefined;
 }
 
+function parseGlobalArgs(argv) {
+  let profile = envValue("SUB_BRIDGE_PROFILE") || "";
+  const args = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--profile") {
+      const value = argv[index + 1];
+      if (!value) throw new Error("--profile requires a value");
+      profile = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--profile=")) {
+      profile = arg.slice("--profile=".length);
+      continue;
+    }
+    args.push(arg);
+  }
+  return { profile: profile.trim(), args };
+}
+
+const GLOBAL_ARGS = parseGlobalArgs(process.argv.slice(2));
+const PROFILE_NAME = GLOBAL_ARGS.profile;
+
+function slug(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function titleCase(value) {
+  return String(value || "")
+    .split(/[-_\s]+/g)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
 const CONFIG_PATH =
   envValue("SUB_BRIDGE_CONFIG", "CODEXSUB_CONFIG") || join(homedir(), ".config", "sub-bridge", "config.json");
 
@@ -43,7 +84,20 @@ function readConfigFile(path = CONFIG_PATH) {
   return parsed;
 }
 
-const CONFIG = readConfigFile();
+const CONFIG_FILE = readConfigFile();
+
+function activeConfig(configFile, profileName) {
+  const base = { ...configFile };
+  delete base.profiles;
+  if (!profileName) return base;
+  const profile = configFile.profiles?.[profileName];
+  return {
+    ...base,
+    ...(profile && typeof profile === "object" && !Array.isArray(profile) ? profile : {}),
+  };
+}
+
+const CONFIG = activeConfig(CONFIG_FILE, PROFILE_NAME);
 
 function configValue(key, envKeys, fallback) {
   const env = envValue(...envKeys);
@@ -72,14 +126,22 @@ const ORIGINATOR = configValue("originator", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB
 const PROVIDER_ID = configValue(
   "providerId",
   ["SUB_BRIDGE_PROVIDER_ID", "CODEXSUB_PROVIDER_ID"],
-  "codexsub-openai-codex",
+  PROFILE_NAME ? `subbridge-${slug(PROFILE_NAME)}` : "codexsub-openai-codex",
 );
-const PROVIDER_NAME = configValue("providerName", ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"], "SubBridge");
+const PROVIDER_NAME = configValue(
+  "providerName",
+  ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"],
+  PROFILE_NAME ? `SubBridge ${titleCase(PROFILE_NAME)}` : "SubBridge",
+);
 const LEGACY_STATE_DIR = join(homedir(), ".local", "state", "gpt-sub-bridge");
 const DEFAULT_STATE_DIR = join(homedir(), ".local", "state", "sub-bridge-cli");
 const USE_LEGACY_STATE = existsSync(join(LEGACY_STATE_DIR, "gpt-sub-bridge.pid"));
 const STATE_DIR =
-  configValue("stateDir", ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"], USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR);
+  configValue(
+    "stateDir",
+    ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"],
+    PROFILE_NAME ? join(DEFAULT_STATE_DIR, slug(PROFILE_NAME)) : USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR,
+  );
 const PID_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.pid" : "sub-bridge.pid";
 const LOG_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.log" : "sub-bridge.log";
 const PID_PATH = configValue("pidPath", ["SUB_BRIDGE_PID_PATH", "CODEXSUB_PID_PATH"], join(STATE_DIR, PID_FILE_NAME));
@@ -166,6 +228,7 @@ const MODELS = [
 
 function usage(exitCode = 0) {
   console.log(`Usage:
+  ${CLI_NAME} --profile <name> status
   ${CLI_NAME} status
   ${CLI_NAME} login
   ${CLI_NAME} logout
@@ -186,6 +249,7 @@ Aliases:
 
 Environment:
   SUB_BRIDGE_CONFIG=${CONFIG_PATH}
+  SUB_BRIDGE_PROFILE=${PROFILE_NAME || "optional-profile"}
   SUB_BRIDGE_PORT=17876
   SUB_BRIDGE_HOST=127.0.0.1
   SUB_BRIDGE_MODEL=gpt-5.5
@@ -1583,6 +1647,7 @@ async function statusCommand() {
   const running = Boolean(pidRunning || health?.ok);
   console.log(JSON.stringify({
     running,
+    profile: PROFILE_NAME || null,
     pid: pidRunning ? pid : null,
     base_url: BASE_URL,
     wire_api: "responses",
@@ -1605,7 +1670,8 @@ async function startCommand() {
 
   removePidFile();
   const out = openSync(LOG_PATH, "a", 0o600);
-  const child = spawn(process.execPath, [process.argv[1], "serve"], {
+  const childArgs = PROFILE_NAME ? [process.argv[1], "--profile", PROFILE_NAME, "serve"] : [process.argv[1], "serve"];
+  const child = spawn(process.execPath, childArgs, {
     detached: true,
     stdio: ["ignore", out, out],
     env: process.env,
@@ -1741,13 +1807,19 @@ function configTemplate() {
 }
 
 function redactedConfig(value) {
-  const copy = { ...value };
+  const copy = JSON.parse(JSON.stringify(value || {}));
   if (copy.bridgeKey) copy.bridgeKey = "<redacted>";
+  if (copy.profiles && typeof copy.profiles === "object") {
+    for (const profile of Object.values(copy.profiles)) {
+      if (profile?.bridgeKey) profile.bridgeKey = "<redacted>";
+    }
+  }
   return copy;
 }
 
 function effectiveConfig() {
   return {
+    profile: PROFILE_NAME || null,
     host: HOST,
     port: PORT,
     model: DEFAULT_MODEL,
@@ -1779,7 +1851,46 @@ function effectiveConfig() {
 
 function writeConfigFile(config) {
   mkdirSync(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const tempPath = `${CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tempPath, CONFIG_PATH);
+}
+
+function writeActiveConfigValue(key, value) {
+  if (!PROFILE_NAME) {
+    writeConfigFile({ ...CONFIG_FILE, [key]: value });
+    return;
+  }
+  const profiles =
+    CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
+      ? { ...CONFIG_FILE.profiles }
+      : {};
+  const profileConfig =
+    profiles[PROFILE_NAME] && typeof profiles[PROFILE_NAME] === "object" && !Array.isArray(profiles[PROFILE_NAME])
+      ? profiles[PROFILE_NAME]
+      : {};
+  profiles[PROFILE_NAME] = { ...profileConfig, [key]: value };
+  writeConfigFile({ ...CONFIG_FILE, profiles });
+}
+
+function unsetActiveConfigValue(key) {
+  if (!PROFILE_NAME) {
+    const nextConfig = { ...CONFIG_FILE };
+    delete nextConfig[key];
+    writeConfigFile(nextConfig);
+    return;
+  }
+  const profiles =
+    CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
+      ? { ...CONFIG_FILE.profiles }
+      : {};
+  const profileConfig =
+    profiles[PROFILE_NAME] && typeof profiles[PROFILE_NAME] === "object" && !Array.isArray(profiles[PROFILE_NAME])
+      ? { ...profiles[PROFILE_NAME] }
+      : {};
+  delete profileConfig[key];
+  profiles[PROFILE_NAME] = profileConfig;
+  writeConfigFile({ ...CONFIG_FILE, profiles });
 }
 
 function configCommand(args) {
@@ -1791,15 +1902,26 @@ function configCommand(args) {
   if (action === "show") {
     console.log(JSON.stringify({
       configPath: CONFIG_PATH,
+      profile: PROFILE_NAME || null,
       exists: existsSync(CONFIG_PATH),
-      file: redactedConfig(CONFIG),
+      file: redactedConfig(CONFIG_FILE),
+      active: redactedConfig(CONFIG),
       effective: effectiveConfig(),
     }, null, 2));
     return;
   }
   if (action === "init") {
     const nextConfig = { ...configTemplate(), ...CONFIG };
-    writeConfigFile(nextConfig);
+    if (PROFILE_NAME) {
+      const profiles =
+        CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
+          ? { ...CONFIG_FILE.profiles }
+          : {};
+      profiles[PROFILE_NAME] = nextConfig;
+      writeConfigFile({ ...CONFIG_FILE, profiles });
+    } else {
+      writeConfigFile(nextConfig);
+    }
     console.log(`wrote ${CONFIG_PATH}`);
     return;
   }
@@ -1814,16 +1936,14 @@ function configCommand(args) {
     const [key, ...rest] = args.slice(1);
     if (!key || rest.length === 0) throw new Error("Usage: sub-bridge config set <key> <value>");
     const value = parseConfigInput(key, rest.join(" "));
-    writeConfigFile({ ...CONFIG, [key]: value });
+    writeActiveConfigValue(key, value);
     console.log(`set ${key}`);
     return;
   }
   if (action === "unset") {
     const key = args[1];
     if (!CONFIG_SCHEMA.has(key)) throw new Error(`Unknown config key: ${key}`);
-    const nextConfig = { ...CONFIG };
-    delete nextConfig[key];
-    writeConfigFile(nextConfig);
+    unsetActiveConfigValue(key);
     console.log(`unset ${key}`);
     return;
   }
@@ -1973,7 +2093,7 @@ function installTarget(targetId = "copilot") {
   target.install();
 }
 
-const args = process.argv.slice(2);
+const args = GLOBAL_ARGS.args;
 const command = args[0] || "status";
 if (command === "serve") startServer();
 else if (command === "start") await startCommand();

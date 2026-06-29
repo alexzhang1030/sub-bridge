@@ -25,6 +25,7 @@ function run(args, env = {}) {
 
 test("prints help with project command names", () => {
   const output = run(["--help"]);
+  assert.match(output, /sub-bridge --profile <name> status/);
   assert.match(output, /sub-bridge status/);
   assert.match(output, /sub-bridge config show/);
   assert.match(output, /sub-bridge install copilot/);
@@ -44,6 +45,21 @@ test("sets config values in the config file", () => {
   const output = JSON.parse(run(["config", "show"]));
   assert.equal(output.file.reasoningEffort, "max");
   assert.equal(output.effective.reasoningEffort, "max");
+});
+
+test("stores profile config separately", () => {
+  rmSync(testConfig, { force: true });
+  assert.match(run(["--profile", "cursor", "config", "set", "backend", "cursor-acp"]), /set backend/);
+  assert.match(run(["config", "set", "backend", "codex"]), /set backend/);
+
+  const cursor = JSON.parse(run(["config", "show", "--profile", "cursor"]));
+  const rootConfig = JSON.parse(run(["config", "show"]));
+  assert.equal(cursor.profile, "cursor");
+  assert.equal(cursor.file.profiles.cursor.backend, "cursor-acp");
+  assert.equal(cursor.effective.profile, "cursor");
+  assert.equal(cursor.effective.backend, "cursor-acp");
+  assert.equal(cursor.effective.providerId, "subbridge-cursor");
+  assert.equal(rootConfig.effective.backend, "codex");
 });
 
 test("lists provider targets", () => {
