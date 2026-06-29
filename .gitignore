@@ -1,0 +1,5 @@
+node_modules/
+.tmp-state/
+.tmp-config*.json
+npm-debug.log*
+.DS_Store

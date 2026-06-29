@@ -1,0 +1,18 @@
+{
+  "name": "sub-bridge-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local OpenAI Responses bridge for subscription-backed coding agents.",
+  "bin": {
+    "sub-bridge": "./bin/sub-bridge"
+  },
+  "scripts": {
+    "check": "node --check bin/sub-bridge && node --check src/cli.js",
+    "test": "node --test",
+    "smoke": "node src/cli.js --help && node src/cli.js targets && node src/cli.js models"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
