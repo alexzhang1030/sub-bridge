@@ -27,8 +27,12 @@ import {
 } from "./provider-plugins.js";
 import {
   cursorOptionsFromModelEntry,
+  filterCursorModelsByGroups,
+  mergeCursorModelVariantsWithBaseControls,
   mergeCursorModelOptions,
+  normalizeModelGroupsConfig,
   parseCursorCliModelList,
+  summarizeCursorModelGroups,
   stripCursorParameterizedSuffix,
 } from "./cursor-models.js";
 
@@ -111,6 +115,7 @@ const SUBSCRIPTION_CONFIG_KEYS = new Set([
   "host",
   "port",
   "models",
+  "modelGroups",
   "providerId",
   "providerName",
 ]);
@@ -413,7 +418,13 @@ function normalizeModelList(models) {
 
 function activeModels() {
   const configured = normalizeModelList(CONFIG.models);
-  return configured.length > 0 ? configured : BUILTIN_MODELS;
+  const models = configured.length > 0 ? configured : BUILTIN_MODELS;
+  const expanded = PROVIDER_PLUGIN.id === "cursor-acp"
+    ? mergeCursorModelVariantsWithBaseControls(models)
+    : models;
+  return PROVIDER_PLUGIN.id === "cursor-acp"
+    ? filterCursorModelsByGroups(expanded, CONFIG.modelGroups)
+    : expanded;
 }
 
 const MODELS = activeModels();
@@ -467,6 +478,8 @@ function usage(exitCode = 0) {
   ${CLI_NAME} config show
   ${CLI_NAME} config init
   ${CLI_NAME} config set <key> <value>
+  ${CLI_NAME} config groups
+  ${CLI_NAME} config group <enable|disable> <group>
   ${CLI_NAME} targets
   ${CLI_NAME} install copilot
 
@@ -2629,6 +2642,7 @@ const CONFIG_SCHEMA = new Map([
   ["host", "string"],
   ["port", "number"],
   ["models", "json"],
+  ["modelGroups", "json"],
   ["type", "string"],
   ["providerId", "string"],
   ["providerName", "string"],
@@ -2684,9 +2698,46 @@ function effectiveConfig() {
     providerName: PROVIDER_NAME,
     defaultModel: DEFAULT_MODEL,
     defaultReasoningEffort: REASONING_EFFORT,
+    modelGroups: PROVIDER_PLUGIN.id === "cursor-acp" ? normalizeModelGroupsConfig(CONFIG.modelGroups) : null,
     models: MODELS,
     baseUrl: BASE_URL,
   };
+}
+
+function cursorModelsForGroupControl() {
+  if (PROVIDER_PLUGIN.id !== "cursor-acp") throw new Error("Model groups require a cursor-acp subscription");
+  const configured = normalizeModelList(CONFIG.models);
+  return mergeCursorModelVariantsWithBaseControls(configured.length > 0 ? configured : BUILTIN_MODELS);
+}
+
+function cursorGroupSummary() {
+  return summarizeCursorModelGroups(cursorModelsForGroupControl(), CONFIG.modelGroups);
+}
+
+function resolveCursorModelGroupId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("Usage: sub-bridge config group <enable|disable> <group>");
+  const groups = cursorGroupSummary();
+  const normalized = slug(raw);
+  const matches = groups.filter((group) =>
+    group.id === raw ||
+    group.id === normalized ||
+    group.id.endsWith(`:${normalized}`) ||
+    slug(group.name) === normalized,
+  );
+  if (matches.length === 1) return matches[0].id;
+  if (matches.length > 1) {
+    throw new Error(`Ambiguous model group '${raw}': ${matches.map((group) => group.id).join(", ")}`);
+  }
+  throw new Error(`Unknown model group: ${raw}`);
+}
+
+function writeCursorModelGroupState(groupId, enabled) {
+  const current = normalizeModelGroupsConfig(CONFIG.modelGroups);
+  const disabled = new Set(current.disabled);
+  if (enabled) disabled.delete(groupId);
+  else disabled.add(groupId);
+  writeActiveConfigValue("modelGroups", { disabled: Array.from(disabled).sort() });
 }
 
 function writeConfigFile(config) {
@@ -2785,6 +2836,25 @@ async function configCommand(args) {
     const value = effectiveConfig()[key] ?? CONFIG[key] ?? null;
     console.log(JSON.stringify(value, null, 2));
     return;
+  }
+  if (action === "groups") {
+    console.log(JSON.stringify(cursorGroupSummary(), null, 2));
+    return;
+  }
+  if (action === "group") {
+    const verb = args[1];
+    const groupId = resolveCursorModelGroupId(args[2]);
+    if (verb === "enable") {
+      writeCursorModelGroupState(groupId, true);
+      console.log(`enabled model group ${groupId}`);
+      return;
+    }
+    if (verb === "disable") {
+      writeCursorModelGroupState(groupId, false);
+      console.log(`disabled model group ${groupId}`);
+      return;
+    }
+    throw new Error("Usage: sub-bridge config group <enable|disable> <group>");
   }
   if (action === "set") {
     const [key, ...rest] = args.slice(1);

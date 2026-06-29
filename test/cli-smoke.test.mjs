@@ -474,6 +474,39 @@ test("cursor init merges ACP model metadata with CLI-only models", () => {
   }
 });
 
+test("cursor model groups enable and disable expanded model families", () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+    }), /wrote/);
+
+    const before = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(before.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+    assert.ok(before.data.some((model) => model.id.includes("[context=1m,effort=high,fast=true,thinking=true]")));
+
+    const groups = JSON.parse(run(["--sub", "cursor", "config", "groups"]));
+    assert.equal(groups.find((group) => group.id === "provider:anthropic")?.enabled, true);
+    assert.ok(groups.find((group) => group.id === "family:claude-haiku-4-5")?.modelCount > 1);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "disable", "anthropic"]), /disabled model group provider:anthropic/);
+    const disabled = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.equal(disabled.data.some((model) => model.id.startsWith("claude-haiku-4-5")), false);
+    assert.ok(disabled.data.some((model) => model.id.startsWith("gpt-5.5")));
+
+    const disabledGroups = JSON.parse(run(["--sub", "cursor", "config", "groups"]));
+    assert.equal(disabledGroups.find((group) => group.id === "provider:anthropic")?.enabled, false);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "enable", "provider:anthropic"]), /enabled model group provider:anthropic/);
+    const enabled = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(enabled.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
 test("cursor init falls back to agent auth for model discovery", () => {
   rmSync(testConfig, { force: true });
   const mock = createMockCursorAgent({ failMemoryAuth: true });

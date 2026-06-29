@@ -91,7 +91,8 @@ Cursor model entries can set ACP options per model:
 ```
 
 `config init` fetches Cursor models through ACP `cursor/list_available_models`
-and keeps your per-model option overrides.
+and keeps your per-model option overrides. Cursor model output follows the
+Synara shape: rich base models first, then raw context/effort/fast variants.
 
 Edit:
 
@@ -99,6 +100,16 @@ Edit:
 sub-bridge --sub cursor config init
 sub-bridge --sub codex config init
 ```
+
+Cursor model groups can be toggled by provider or family:
+
+```bash
+sub-bridge --sub cursor config groups
+sub-bridge --sub cursor config group disable provider:anthropic
+sub-bridge --sub cursor config group enable claude-opus-4-8
+```
+
+Group filters affect `models`, serving, and Copilot registration.
 
 Runtime overrides stay in env vars, for example:
 

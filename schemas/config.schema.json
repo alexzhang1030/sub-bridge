@@ -71,6 +71,16 @@
         }
       }
     },
+    "modelGroups": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "subscription": {
       "type": "object",
       "required": ["type", "host", "port", "providerId", "providerName", "models"],
@@ -84,7 +94,8 @@
         "models": {
           "type": "array",
           "items": { "$ref": "#/$defs/model" }
-        }
+        },
+        "modelGroups": { "$ref": "#/$defs/modelGroups" }
       }
     }
   }
