@@ -17,6 +17,14 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { cursorAbout, fetchCursorAcpModels, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
+import { defaultCursorAcpCommand, makeCursorProbeEnv } from "./cursor-runtime.js";
+import {
+  defaultProviderId as defaultPluginProviderId,
+  defaultProviderName as defaultPluginProviderName,
+  defaultProviderPort,
+  defaultProviderTypeForSub,
+  providerPluginForType,
+} from "./provider-plugins.js";
 import {
   cursorOptionsFromModelEntry,
   mergeCursorModelOptions,
@@ -73,14 +81,6 @@ function slug(value) {
     .replace(/^-+|-+$/g, "");
 }
 
-function titleCase(value) {
-  return String(value || "")
-    .split(/[-_\s]+/g)
-    .filter(Boolean)
-    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
-    .join(" ");
-}
-
 function subEnvKey(suffix) {
   const name = slug(SUB_NAME).replace(/-/g, "_").toUpperCase();
   return name ? `SUB_BRIDGE_${name}_${suffix}` : "";
@@ -91,36 +91,19 @@ function envKeysForSub(suffix, fallbackKeys = []) {
 }
 
 function defaultTypeForSub(subName) {
-  return slug(subName) === "cursor" ? "cursor-acp" : "codex";
+  return defaultProviderTypeForSub(subName);
 }
 
 function defaultPortForSub(subName, type) {
-  const normalizedSub = slug(subName);
-  const normalizedType = type === "cursor" ? "cursor-acp" : type;
-  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return 17876;
-  if (normalizedSub === "codex" || normalizedType === "codex") return 17877;
-  return 17876;
+  return defaultProviderPort(subName, type);
 }
 
 function defaultProviderId(subName, type) {
-  const normalizedSub = slug(subName);
-  const normalizedType = type === "cursor" ? "cursor-acp" : type;
-  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return "codexsub-openai-codex";
-  if (normalizedSub === "codex" || normalizedType === "codex") return "subbridge-codex";
-  return `subbridge-${normalizedSub || "default"}`;
+  return defaultPluginProviderId(subName, type);
 }
 
 function defaultProviderName(subName, type) {
-  const normalizedSub = slug(subName);
-  const normalizedType = type === "cursor" ? "cursor-acp" : type;
-  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return "SubBridge";
-  if (normalizedSub === "codex" || normalizedType === "codex") return "SubBridge Codex";
-  return `SubBridge ${titleCase(normalizedSub || "default")}`;
-}
-
-function defaultCursorAcpCommand() {
-  const localAgent = join(homedir(), ".local", "bin", "agent");
-  return existsSync(localAgent) ? localAgent : "agent";
+  return defaultPluginProviderName(subName, type);
 }
 
 const SUBSCRIPTION_CONFIG_KEYS = new Set([
@@ -206,6 +189,7 @@ function configBoolean(key, envKeys, fallback) {
 }
 
 const BACKEND = configValue("type", envKeysForSub("TYPE", ["SUB_BRIDGE_TYPE"]), defaultTypeForSub(SUB_NAME));
+const PROVIDER_PLUGIN = providerPluginForType(BACKEND);
 const AUTH_PATH =
   configValue(
     "authPath",
@@ -307,6 +291,11 @@ const CURSOR_ACP_TIMEOUT_MS = configNumber(
   600000,
 );
 const CURSOR_FORCE_CI = configBoolean("cursorForceCi", envKeysForSub("CURSOR_FORCE_CI", ["SUB_BRIDGE_CURSOR_FORCE_CI"]), "0");
+const OFFLINE_DISCOVERY = configBoolean(
+  "offlineDiscovery",
+  envKeysForSub("OFFLINE", ["SUB_BRIDGE_OFFLINE", "SUB_BRIDGE_DISABLE_PROVIDER_DISCOVERY"]),
+  "0",
+);
 const CURSOR_LOCAL_AUTH_DIR =
   envValue(...envKeysForSub("CURSOR_AUTH_DIR", ["SUB_BRIDGE_CURSOR_AUTH_DIR"])) ||
   join(DEFAULT_STATE_DIR, "cursor-auth");
@@ -2048,13 +2037,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
 }
 
 async function forwardResponses(req, res, bodyText) {
-  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
-    return forwardResponsesCursorAcp(req, res, bodyText);
-  }
-  if (USE_PI_WRAPPER) {
-    return forwardResponsesPi(req, res, bodyText);
-  }
-  return forwardResponsesRaw(req, res, bodyText);
+  return PROVIDER_PLUGIN.forwardResponses(providerPluginContext(), req, res, bodyText);
 }
 
 function json(res, status, body) {
@@ -2087,36 +2070,7 @@ function startServer() {
       }
 
       if (url.pathname === "/healthz") {
-        if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
-          const about = cursorAbout({
-            command: CURSOR_ACP_COMMAND,
-            env: makeCursorRuntimeEnv(),
-            timeoutMs: 8000,
-          });
-          json(res, 200, {
-            ok: true,
-            provider: PROVIDER_NAME,
-            runtime: "cursor-acp",
-            type: BACKEND,
-            default_model: DEFAULT_MODEL,
-            cursor_command: CURSOR_ACP_COMMAND,
-            cursor_workspace: CURSOR_WORKSPACE,
-            cursor_model: CURSOR_MODEL,
-            cursor: about,
-          });
-          return;
-        }
-        const { accountId } = await loadCodexAuth();
-        json(res, 200, {
-          ok: true,
-          provider: PROVIDER_NAME,
-          runtime: USE_PI_WRAPPER ? "pi" : "direct",
-          type: BACKEND,
-          pi_runtime_dir: USE_PI_WRAPPER ? PI_RUNTIME_DIR : null,
-          pi_transport: USE_PI_WRAPPER ? PI_TRANSPORT : null,
-          default_model: DEFAULT_MODEL,
-          account_id_present: Boolean(accountId),
-        });
+        json(res, 200, await PROVIDER_PLUGIN.health(providerPluginContext()));
         return;
       }
 
@@ -2263,6 +2217,7 @@ async function statusCommand() {
   } catch {}
 
   const running = Boolean(pidRunning || health?.ok);
+  const pluginStatusFields = PROVIDER_PLUGIN.statusFields(providerPluginContext());
   console.log(JSON.stringify({
     running,
     subscription: SUB_NAME || null,
@@ -2271,7 +2226,7 @@ async function statusCommand() {
     wire_api: "responses",
     type: BACKEND,
     default_model: DEFAULT_MODEL,
-    cursor_model: BACKEND === "cursor-acp" || BACKEND === "cursor" ? CURSOR_MODEL : null,
+    ...pluginStatusFields,
     health: health?.body || null,
     pid_path: PID_PATH,
     log_path: LOG_PATH,
@@ -2293,8 +2248,8 @@ function runProbe(command, args = [], options = {}) {
   };
 }
 
-function commandProbe(command, args = ["--version"]) {
-  const result = runProbe(command, args);
+function commandProbe(command, args = ["--version"], options = {}) {
+  const result = runProbe(command, args, options);
   return {
     available: !result.error,
     ok: result.ok,
@@ -2302,6 +2257,36 @@ function commandProbe(command, args = ["--version"]) {
     stdout: result.stdout,
     stderr: result.stderr,
     error: result.error,
+  };
+}
+
+function providerPluginContext() {
+  return {
+    backend: BACKEND,
+    providerName: PROVIDER_NAME,
+    defaultModel: DEFAULT_MODEL,
+    usePiWrapper: USE_PI_WRAPPER,
+    piRuntimeDir: PI_RUNTIME_DIR,
+    piTransport: PI_TRANSPORT,
+    cursorAcpCommand: CURSOR_ACP_COMMAND,
+    cursorWorkspace: CURSOR_WORKSPACE,
+    cursorModel: CURSOR_MODEL,
+    commandProbe,
+    makeCursorRuntimeEnv,
+    makeCursorProbeEnv,
+    cursorAbout,
+    cursorAuthDoctor,
+    codexAuthDoctor,
+    loadCodexAuth,
+    loginCursor,
+    loginCodex,
+    logoutCursor,
+    logoutCodex,
+    fetchCursorModelSnapshot,
+    fetchCodexModelSnapshot,
+    forwardResponsesCursorAcp,
+    forwardResponsesPi,
+    forwardResponsesRaw,
   };
 }
 
@@ -2404,7 +2389,7 @@ async function doctorCommand() {
     health = { ok: false, status: null, body: null, error: error instanceof Error ? error.message : String(error) };
   }
 
-  const isCursorBackend = BACKEND === "cursor-acp" || BACKEND === "cursor";
+  const providerDoctor = PROVIDER_PLUGIN.doctor(providerPluginContext());
   console.log(JSON.stringify({
     subscription: SUB_NAME || null,
     configPath: CONFIG_PATH,
@@ -2420,23 +2405,10 @@ async function doctorCommand() {
     },
     tools: {
       node: { version: process.version },
-      codex: commandProbe("codex", ["--version"]),
-      cursorAgent: commandProbe(CURSOR_ACP_COMMAND, ["about", "--format", "json"]),
+      ...providerDoctor.tools,
       sqlite3: commandProbe("sqlite3", ["--version"]),
     },
-    auth: {
-      cursor: isCursorBackend
-        ? {
-            local: cursorAuthDoctor(),
-            agent: cursorAbout({
-              command: CURSOR_ACP_COMMAND,
-              env: makeCursorRuntimeEnv(),
-              timeoutMs: 8000,
-            }),
-          }
-        : null,
-      codex: codexAuthDoctor(),
-    },
+    auth: providerDoctor.auth,
     macos: {
       launchd: launchdDoctor(),
     },
@@ -2521,29 +2493,37 @@ function stopCommand() {
   console.log(`stopped pid=${pid}`);
 }
 
-function loginCommand() {
-  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
-    const token = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
-    if (!token || !String(token).trim()) {
-      throw new Error("Set SUB_BRIDGE_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN, then run cursor login again.");
-    }
-    saveCursorAuthToken(token);
-    console.log(`stored cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
-    return;
+function loginCursor() {
+  const token = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
+  if (!token || !String(token).trim()) {
+    throw new Error("Set SUB_BRIDGE_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN, then run cursor login again.");
   }
+  saveCursorAuthToken(token);
+  console.log(`stored cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+}
+
+function loginCodex() {
   const result = spawnSync("codex", ["login"], { stdio: "inherit" });
+  process.exitCode = result.status ?? 1;
+}
+
+function loginCommand() {
+  return PROVIDER_PLUGIN.login(providerPluginContext());
+}
+
+function logoutCursor() {
+  removeCursorAuthToken();
+  console.log(`removed cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+}
+
+function logoutCodex() {
+  const result = spawnSync("codex", ["logout"], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
 }
 
 function logoutCommand() {
   stopCommand();
-  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
-    removeCursorAuthToken();
-    console.log(`removed cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
-    return;
-  }
-  const result = spawnSync("codex", ["logout"], { stdio: "inherit" });
-  process.exitCode = result.status ?? 1;
+  return PROVIDER_PLUGIN.logout(providerPluginContext());
 }
 
 function modelsCommand() {
@@ -2616,6 +2596,10 @@ function mergeFetchedModels(fetchedModels, configuredModels) {
 }
 
 async function fetchCursorModelSnapshot() {
+  if (OFFLINE_DISCOVERY) {
+    return { models: BUILTIN_MODELS, source: "builtin", offline: true };
+  }
+
   const fetchViaAcp = async (env, source) => {
     const models = normalizeModelList(await fetchCursorAcpModels({
       command: CURSOR_ACP_COMMAND,
@@ -2667,6 +2651,10 @@ function fetchCursorModelCommandSnapshot() {
 }
 
 async function fetchCodexModelSnapshot() {
+  if (OFFLINE_DISCOVERY) {
+    return { models: BUILTIN_MODELS, source: "builtin", offline: true };
+  }
+
   try {
     const runtime = await loadPiRuntime();
     const models = normalizeModelList(Array.from(runtime.models.values()).map((model) => ({
@@ -2687,10 +2675,7 @@ async function fetchCodexModelSnapshot() {
 }
 
 async function fetchModelSnapshot() {
-  const snapshot =
-    BACKEND === "cursor-acp" || BACKEND === "cursor"
-      ? await fetchCursorModelSnapshot()
-      : await fetchCodexModelSnapshot();
+  const snapshot = await PROVIDER_PLUGIN.fetchModelSnapshot(providerPluginContext());
   return {
     models: mergeFetchedModels(snapshot.models, CONFIG.models),
   };

@@ -1,6 +1,6 @@
 {
   "name": "sub-bridge-cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Local OpenAI Responses bridge for subscription-backed coding agents.",
@@ -8,7 +8,7 @@
     "sub-bridge": "./bin/sub-bridge"
   },
   "scripts": {
-    "check": "node --check bin/sub-bridge && node --check src/cli.js && node --check src/cursor-acp.js && node --check src/cursor-models.js",
+    "check": "node --check bin/sub-bridge && node --check src/cli.js && node --check src/cursor-acp.js && node --check src/cursor-models.js && node --check src/cursor-runtime.js && node --check src/provider-plugins.js",
     "ci": "npm run check && bash -n install.sh && bash -n scripts/test-install.sh && npm test && npm run test:install && npm run smoke",
     "test:install": "bash scripts/test-install.sh",
     "test": "node --test",

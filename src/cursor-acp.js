@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { makeCursorEnv } from "./cursor-runtime.js";
 import {
   collectCursorAcpConfigUpdates,
   cursorModelsFromAvailableModels,
@@ -10,6 +11,8 @@ import {
   modelConfigId,
   resolveCursorAcpModelValue,
 } from "./cursor-models.js";
+
+export { makeCursorEnv } from "./cursor-runtime.js";
 
 const packageInfo = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const clientInfo = { name: "sub-bridge", version: String(packageInfo.version || "0.0.0") };
@@ -562,13 +565,6 @@ export async function fetchCursorAcpModels(options) {
   } finally {
     client.close();
   }
-}
-
-export function makeCursorEnv({ baseEnv = process.env, forceCi = true } = {}) {
-  return {
-    ...baseEnv,
-    ...(forceCi ? { CI: "1" } : {}),
-  };
 }
 
 export function cursorAbout({ command, env, timeoutMs = 8000 }) {

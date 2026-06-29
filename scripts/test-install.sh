@@ -12,6 +12,7 @@ trap cleanup EXIT
 
 HOME="$tmp_home" \
 PREFIX="$tmp_prefix" \
+SUB_BRIDGE_OFFLINE=1 \
 SUB_BRIDGE_INSTALL_SKIP_LAUNCHCTL=1 \
 "$repo_dir/install.sh" --launch-agent --no-copilot
 

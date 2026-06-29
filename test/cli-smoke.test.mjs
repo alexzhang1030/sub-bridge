@@ -6,6 +6,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { responsesBodyToCursorPrompt, runCursorAcpTurn } from "../src/cursor-acp.js";
 import { cursorOptionsFromModelEntry } from "../src/cursor-models.js";
+import {
+  defaultProviderId,
+  defaultProviderName,
+  defaultProviderPort,
+  defaultProviderTypeForSub,
+  providerPluginForType,
+} from "../src/provider-plugins.js";
 
 const root = new URL("..", import.meta.url).pathname;
 const cli = join(root, "src", "cli.js");
@@ -245,6 +252,19 @@ function parseSseTypes(text) {
   return types;
 }
 
+test("provider plugins resolve defaults for cursor, codex, and custom subscriptions", () => {
+  assert.equal(defaultProviderTypeForSub("cursor"), "cursor-acp");
+  assert.equal(defaultProviderTypeForSub("codex"), "codex");
+  assert.equal(providerPluginForType("cursor").id, "cursor-acp");
+  assert.equal(providerPluginForType("cursor-acp").id, "cursor-acp");
+  assert.equal(providerPluginForType("codex").id, "codex");
+
+  assert.equal(defaultProviderPort("cursor", "cursor-acp"), 17876);
+  assert.equal(defaultProviderPort("codex", "codex"), 17877);
+  assert.equal(defaultProviderId("team-sub", "custom"), "subbridge-team-sub");
+  assert.equal(defaultProviderName("team-sub", "custom"), "SubBridge Team Sub");
+});
+
 test("prints help with project command names", () => {
   const output = run(["--help"]);
   assert.match(output, /sub-bridge --sub <name> status/);
@@ -319,6 +339,46 @@ test("subscription init stores subscription metadata and models", () => {
   assert.ok(Array.isArray(cursor.file.subscriptions.cursor.models));
   assert.ok(cursor.file.subscriptions.cursor.models.some((model) => model.id === "gpt-5.5"));
   assert.equal(cursor.effective.defaultModel, "gpt-5.5");
+});
+
+test("offline cursor config init uses builtin models without spawning provider commands", () => {
+  rmSync(testConfig, { force: true });
+  const dir = mkdtempSync(join(tmpdir(), "sub-bridge-offline-agent-"));
+  const command = join(dir, "agent.mjs");
+  const invokedPath = join(dir, "invoked");
+  writeFileSync(command, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(invokedPath)}, process.argv.slice(2).join(" "));
+process.exit(9);
+`, { mode: 0o755 });
+  chmodSync(command, 0o755);
+
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      SUB_BRIDGE_OFFLINE: "1",
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: command,
+    }), /wrote/);
+
+    const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+    assert.ok(cursor.file.subscriptions.cursor.models.some((model) => model.id === "gpt-5.5"));
+    assert.equal(existsSync(invokedPath), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("offline codex config init uses builtin models through provider plugin", () => {
+  rmSync(testConfig, { force: true });
+  assert.match(run(["--sub", "codex", "config", "set", "type", "codex"]), /set type/);
+  assert.match(run(["--sub", "codex", "config", "init"], {
+    SUB_BRIDGE_OFFLINE: "1",
+    SUB_BRIDGE_PI_DIR: join(root, `.tmp-missing-pi-${process.pid}`),
+  }), /wrote/);
+
+  const codex = JSON.parse(run(["--sub", "codex", "config", "show"]));
+  assert.equal(codex.file.subscriptions.codex.type, "codex");
+  assert.ok(codex.file.subscriptions.codex.models.some((model) => model.id === "gpt-5.5"));
 });
 
 test("cursor init fetches models from ACP available models", () => {
@@ -665,7 +725,8 @@ test("doctor reports local surfaces without token values", () => {
   assert.equal(output.auth.codex.exists, false);
   assert.equal(output.auth.codex.accessTokenPresent, false);
   assert.equal(output.copilot.exists, false);
-  assert.equal(output.tools.cursorAgent.available, false);
+  assert.equal(output.tools.cursorAgent.checked, false);
+  assert.equal(output.tools.cursorAgent.reason, "inactive-backend");
   assert.equal(JSON.stringify(output).includes("access_token"), false);
 });
 
