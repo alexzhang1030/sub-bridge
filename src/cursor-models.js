@@ -373,6 +373,10 @@ function normalizeCursorCliBaseModelId(model) {
   return withoutVariantSuffixes;
 }
 
+export function normalizeCursorModelVariantBaseId(model) {
+  return normalizeCursorCliBaseModelId(stripCursorParameterizedSuffix(model));
+}
+
 function parseCursorCliReasoningEffort(model) {
   const tokens = String(model || "").trim().toLowerCase().split("-");
   for (let index = tokens.length - 1; index >= 0; index -= 1) {
@@ -406,6 +410,263 @@ export function cursorModelOptionsFromCliModelId(model) {
     ...(lower.includes("-thinking") ? { thinking: true } : {}),
     ...(isCursorCliOneMillionContextModel(lower) ? { contextWindow: "1m" } : {}),
   };
+}
+
+function uniqueByValue(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (!value?.value || seen.has(value.value)) continue;
+    seen.add(value.value);
+    result.push(value);
+  }
+  return result;
+}
+
+function removeVariantNameSuffix(name) {
+  return String(name || "")
+    .replace(/\s+Fast$/iu, "")
+    .replace(/\s+Thinking$/iu, "")
+    .replace(/\s+Fast$/iu, "")
+    .replace(/\s+(?:None|Low|Medium|High|Extra High|Max)$/iu, "")
+    .replace(/\s+1M$/u, "")
+    .trim();
+}
+
+function defaultEffortForCursorGroup(baseId, efforts) {
+  if (efforts.length === 0) return "";
+  if (baseId.includes("gpt") || baseId.includes("codex")) return efforts.includes("medium") ? "medium" : efforts[0];
+  if (baseId.includes("claude")) return efforts.includes("high") ? "high" : efforts[0];
+  return efforts[0];
+}
+
+function isCursorOneMillionVariant(model) {
+  if (model.defaultContextWindow === "1m") return true;
+  if (model.contextWindowOptions?.some((option) => option.value === "1m" && option.isDefault === true)) return true;
+  return /\b1M\b/u.test(model.displayName || "");
+}
+
+function fallbackContextWindowOptionsForCursorBase(baseId, variants) {
+  if (!variants.some(isCursorOneMillionVariant)) return [];
+  if (baseId === "gpt-5.5" || baseId === "gpt-5.4") {
+    return [
+      { value: "272k", label: "272K", isDefault: true },
+      { value: "1m", label: "1M" },
+    ];
+  }
+  if (baseId === "claude-fable-5" || baseId === "claude-opus-4-8" || baseId === "claude-opus-4-7") {
+    return [
+      { value: "300k", label: "300K", isDefault: true },
+      { value: "1m", label: "1M" },
+    ];
+  }
+  if (baseId === "claude-opus-4-6" || baseId === "claude-sonnet-4-6") {
+    return [
+      { value: "200k", label: "200K", isDefault: true },
+      { value: "1m", label: "1M" },
+    ];
+  }
+  return [];
+}
+
+function cursorVariantDisplayName(baseName, { contextWindow, reasoningEffort, fastMode, thinking }) {
+  const parts = [removeVariantNameSuffix(baseName) || baseName];
+  if (contextWindow) parts.push(cursorContextWindowLabel(contextWindow));
+  if (reasoningEffort) parts.push(cursorReasoningLabel(reasoningEffort));
+  if (thinking) parts.push("Thinking");
+  if (fastMode) parts.push("Fast");
+  return parts.filter(Boolean).join(" ");
+}
+
+function cursorVariantId(baseId, { contextWindow, reasoningEffort, fastMode, thinking }) {
+  const params = {};
+  if (contextWindow) params.context = contextWindow;
+  if (reasoningEffort) params.effort = cursorReasoningParameterValue(reasoningEffort);
+  if (fastMode) params.fast = "true";
+  if (thinking) params.thinking = "true";
+  return buildCursorParameterizedModelSlug(baseId, params);
+}
+
+function cursorVariantOptionsForModel(model) {
+  const effortValues = uniqueByValue([
+    ...(model.supportedReasoningEfforts || []),
+    ...(model.defaultReasoningEffort ? [{ value: model.defaultReasoningEffort, label: cursorReasoningLabel(model.defaultReasoningEffort) }] : []),
+    ...(model.reasoningEffort ? [{ value: model.reasoningEffort, label: cursorReasoningLabel(model.reasoningEffort) }] : []),
+  ])
+    .map((entry) => normalizeCursorReasoningValue(entry.value))
+    .filter(Boolean);
+  const contextValues = uniqueByValue([
+    ...(model.contextWindowOptions || []),
+    ...(model.defaultContextWindow ? [{ value: model.defaultContextWindow, label: cursorContextWindowLabel(model.defaultContextWindow) }] : []),
+    ...(model.cursorContextWindow ? [{ value: model.cursorContextWindow, label: cursorContextWindowLabel(model.cursorContextWindow) }] : []),
+    ...(model.contextOption ? [{ value: model.contextOption, label: cursorContextWindowLabel(model.contextOption) }] : []),
+  ])
+    .map((entry) => String(entry.value || "").trim())
+    .filter(Boolean);
+  return {
+    efforts: effortValues.length > 0 ? effortValues : [""],
+    contexts: contextValues.length > 0 ? contextValues : [""],
+    fastModes: model.supportsFastMode ? [false, true] : [false],
+    thinkingModes: model.supportsThinking ? [false, true] : [false],
+  };
+}
+
+function generatedCursorVariantsForModel(model) {
+  const baseId = normalizeCursorModelVariantBaseId(model.id);
+  if (!baseId || model.id.includes("[") || normalizeCursorModelVariantBaseId(model.id) !== model.id) return [];
+  const { efforts, contexts, fastModes, thinkingModes } = cursorVariantOptionsForModel(model);
+  if (
+    efforts.every((value) => !value) &&
+    contexts.every((value) => !value) &&
+    fastModes.length === 1 &&
+    thinkingModes.length === 1
+  ) {
+    return [];
+  }
+  const variants = [];
+  for (const contextWindow of contexts) {
+    for (const reasoningEffort of efforts) {
+      for (const fastMode of fastModes) {
+        for (const thinking of thinkingModes) {
+          if (!contextWindow && !reasoningEffort && !fastMode && !thinking) continue;
+          const id = cursorVariantId(baseId, { contextWindow, reasoningEffort, fastMode, thinking });
+          if (id === model.id) continue;
+          variants.push({
+            ...model,
+            id,
+            displayName: cursorVariantDisplayName(model.displayName, {
+              contextWindow,
+              reasoningEffort,
+              fastMode,
+              thinking,
+            }),
+            contextWindow: contextWindowTokens(contextWindow, model.contextWindow),
+            ...(contextWindow ? { cursorContextWindow: contextWindow } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
+            ...(fastMode ? { fastMode: true } : {}),
+            ...(thinking ? { thinking: true } : {}),
+          });
+        }
+      }
+    }
+  }
+  return variants;
+}
+
+export function collapseCursorModelVariants(models) {
+  const groups = new Map();
+  for (const model of Array.isArray(models) ? models : []) {
+    const baseId = normalizeCursorModelVariantBaseId(model.id) || model.id;
+    const group = groups.get(baseId);
+    if (group) group.push(model);
+    else groups.set(baseId, [model]);
+  }
+
+  return Array.from(groups.entries()).map(([baseId, variants]) => {
+    const preferred =
+      variants.find((variant) => variant.id === baseId) ||
+      variants.find((variant) => !variant.id.endsWith("-fast")) ||
+      variants[0];
+    const efforts = uniqueByValue(variants.flatMap((variant) => [
+      ...(variant.supportedReasoningEfforts || []),
+      ...(parseCursorCliReasoningEffort(variant.id)
+        ? [{ value: parseCursorCliReasoningEffort(variant.id), label: cursorReasoningLabel(parseCursorCliReasoningEffort(variant.id)) }]
+        : []),
+      ...(variant.defaultReasoningEffort
+        ? [{ value: variant.defaultReasoningEffort, label: cursorReasoningLabel(variant.defaultReasoningEffort) }]
+        : []),
+    ]));
+    const effortValues = efforts.map((effort) => effort.value);
+    const defaultEffort =
+      variants.find((variant) => normalizeCursorModelVariantBaseId(variant.id) === variant.id)?.defaultReasoningEffort ||
+      defaultEffortForCursorGroup(baseId, effortValues);
+    const contextWindowOptions = uniqueByValue([
+      ...fallbackContextWindowOptionsForCursorBase(baseId, variants),
+      ...variants.flatMap((variant) => variant.contextWindowOptions || []),
+    ]);
+    const upstreamProviderId = preferred?.upstreamProviderId;
+    const upstreamProviderName = preferred?.upstreamProviderName;
+    return buildModelEntry({
+      id: baseId,
+      displayName: removeVariantNameSuffix(preferred?.displayName || humanizeCursorModelName(baseId)),
+      contextWindow: contextWindowTokens(
+        contextWindowOptions.find((option) => option.isDefault)?.value || contextWindowOptions[0]?.value,
+        preferred?.contextWindow || 128000,
+      ),
+      maxTokens: preferred?.maxTokens || 128000,
+      upstreamProviderId,
+      upstreamProviderName,
+      supportedReasoningEfforts: efforts.map((effort) => ({
+        value: effort.value,
+        label: effort.label || cursorReasoningLabel(effort.value),
+        ...(effort.value === defaultEffort ? { isDefault: true } : {}),
+      })),
+      defaultReasoningEffort: defaultEffort,
+      supportsFastMode: variants.some((variant) => variant.supportsFastMode === true),
+      supportsThinking: variants.some((variant) => variant.supportsThinking === true),
+      contextWindowOptions,
+      defaultContextWindow:
+        contextWindowOptions.find((option) => option.isDefault)?.value ||
+        contextWindowOptions[0]?.value ||
+        preferred?.defaultContextWindow,
+    });
+  });
+}
+
+export function mergeCursorModelVariantsWithBaseControls(models) {
+  const normalized = Array.isArray(models) ? models : [];
+  const expanded = normalized.flatMap((model) => [model, ...generatedCursorVariantsForModel(model)]);
+  const seen = new Set();
+  const merged = [];
+  for (const model of [...collapseCursorModelVariants(expanded), ...expanded]) {
+    const key = String(model?.id || "").trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(model);
+  }
+  return merged;
+}
+
+export function cursorModelGroupEntries(model) {
+  const providerId = String(model?.upstreamProviderId || "cursor").trim().toLowerCase() || "cursor";
+  const providerName = String(model?.upstreamProviderName || "Cursor").trim() || "Cursor";
+  const familyId = normalizeCursorModelVariantBaseId(model?.id) || String(model?.id || "").trim();
+  const familyName = removeVariantNameSuffix(model?.displayName || humanizeCursorModelName(familyId));
+  return [
+    { id: `provider:${providerId}`, type: "provider", name: providerName },
+    { id: `family:${familyId}`, type: "family", name: familyName },
+  ];
+}
+
+export function normalizeModelGroupsConfig(config) {
+  const disabled = Array.isArray(config?.disabled) ? config.disabled : [];
+  return {
+    disabled: Array.from(new Set(disabled.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
+  };
+}
+
+export function filterCursorModelsByGroups(models, config) {
+  const disabled = new Set(normalizeModelGroupsConfig(config).disabled);
+  if (disabled.size === 0) return Array.isArray(models) ? models : [];
+  return (Array.isArray(models) ? models : []).filter((model) =>
+    cursorModelGroupEntries(model).every((group) => !disabled.has(group.id)),
+  );
+}
+
+export function summarizeCursorModelGroups(models, config) {
+  const disabled = new Set(normalizeModelGroupsConfig(config).disabled);
+  const byId = new Map();
+  for (const model of Array.isArray(models) ? models : []) {
+    for (const group of cursorModelGroupEntries(model)) {
+      const current = byId.get(group.id) || { ...group, modelCount: 0, enabled: !disabled.has(group.id) };
+      current.modelCount += 1;
+      current.enabled = !disabled.has(group.id);
+      byId.set(group.id, current);
+    }
+  }
+  return Array.from(byId.values()).sort((left, right) =>
+    left.type.localeCompare(right.type) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+  );
 }
 
 function cursorModelOptionsFromModelParameters(model) {

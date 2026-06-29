@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { responsesBodyToCursorPrompt, runCursorAcpTurn } from "../src/cursor-acp.js";
-import { cursorOptionsFromModelEntry } from "../src/cursor-models.js";
+import {
+  cursorOptionsFromModelEntry,
+  filterCursorModelsByGroups,
+  mergeCursorModelVariantsWithBaseControls,
+  summarizeCursorModelGroups,
+} from "../src/cursor-models.js";
 import {
   defaultProviderId,
   defaultProviderName,
@@ -564,6 +569,46 @@ test("cursor model options preserve legacy off as fast mode off", () => {
   }), {
     fastMode: false,
   });
+});
+
+test("cursor model variants follow Synara base plus raw variant shape", () => {
+  const models = mergeCursorModelVariantsWithBaseControls([
+    {
+      id: "claude-opus-4-8",
+      displayName: "Opus 4.8",
+      contextWindow: 300000,
+      maxTokens: 128000,
+      upstreamProviderId: "anthropic",
+      upstreamProviderName: "Anthropic",
+      supportedReasoningEfforts: [
+        { value: "low", label: "Low" },
+        { value: "xhigh", label: "Extra High" },
+      ],
+      defaultReasoningEffort: "xhigh",
+      supportsFastMode: true,
+      contextWindowOptions: [
+        { value: "300k", label: "300K", isDefault: true },
+        { value: "1m", label: "1M" },
+      ],
+      defaultContextWindow: "300k",
+    },
+  ]);
+
+  assert.deepEqual(models.slice(0, 4).map((model) => model.id), [
+    "claude-opus-4-8",
+    "claude-opus-4-8[context=300k,effort=low]",
+    "claude-opus-4-8[context=300k,effort=low,fast=true]",
+    "claude-opus-4-8[context=300k,effort=extra-high]",
+  ]);
+  assert.ok(models.some((model) =>
+    model.id === "claude-opus-4-8[context=1m,effort=extra-high,fast=true]" &&
+    model.displayName === "Opus 4.8 1M Extra High Fast",
+  ));
+
+  const groups = summarizeCursorModelGroups(models, { disabled: ["family:claude-opus-4-8"] });
+  assert.equal(groups.find((group) => group.id === "provider:anthropic")?.modelCount, models.length);
+  assert.equal(groups.find((group) => group.id === "family:claude-opus-4-8")?.enabled, false);
+  assert.deepEqual(filterCursorModelsByGroups(models, { disabled: ["provider:anthropic"] }), []);
 });
 
 test("cursor ACP surfaces reasoning, tool calls, and assistant events", async () => {
