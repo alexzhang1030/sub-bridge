@@ -107,6 +107,8 @@ Cursor model groups can be toggled by provider or family:
 sub-bridge --sub cursor config groups
 sub-bridge --sub cursor config group disable provider:anthropic
 sub-bridge --sub cursor config group enable claude-opus-4-8
+sub-bridge --sub cursor config group only claude-opus-4-8 gpt-5.5 composer-2.5 glm-5.2
+sub-bridge --sub cursor config group reset
 ```
 
 Group filters affect `models`, serving, and Copilot registration.

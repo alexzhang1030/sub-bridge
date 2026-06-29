@@ -480,6 +480,8 @@ function usage(exitCode = 0) {
   ${CLI_NAME} config set <key> <value>
   ${CLI_NAME} config groups
   ${CLI_NAME} config group <enable|disable> <group>
+  ${CLI_NAME} config group only <group...>
+  ${CLI_NAME} config group reset
   ${CLI_NAME} targets
   ${CLI_NAME} install copilot
 
@@ -2716,7 +2718,7 @@ function cursorGroupSummary() {
 
 function resolveCursorModelGroupId(value) {
   const raw = String(value || "").trim();
-  if (!raw) throw new Error("Usage: sub-bridge config group <enable|disable> <group>");
+  if (!raw) throw new Error("Usage: sub-bridge config group <enable|disable|only|reset> <group...>");
   const groups = cursorGroupSummary();
   const normalized = slug(raw);
   const matches = groups.filter((group) =>
@@ -2732,12 +2734,44 @@ function resolveCursorModelGroupId(value) {
   throw new Error(`Unknown model group: ${raw}`);
 }
 
+function resolveCursorModelGroupIds(values) {
+  const groupIds = values.map(resolveCursorModelGroupId);
+  return Array.from(new Set(groupIds)).sort();
+}
+
 function writeCursorModelGroupState(groupId, enabled) {
   const current = normalizeModelGroupsConfig(CONFIG.modelGroups);
   const disabled = new Set(current.disabled);
+  const only = new Set(current.only);
+  if (only.size > 0) {
+    if (enabled) {
+      disabled.delete(groupId);
+      only.add(groupId);
+    } else if (only.has(groupId)) {
+      only.delete(groupId);
+    } else {
+      disabled.add(groupId);
+    }
+    writeActiveConfigValue("modelGroups", {
+      disabled: Array.from(disabled).sort(),
+      only: Array.from(only).sort(),
+    });
+    return;
+  }
   if (enabled) disabled.delete(groupId);
   else disabled.add(groupId);
-  writeActiveConfigValue("modelGroups", { disabled: Array.from(disabled).sort() });
+  writeActiveConfigValue("modelGroups", {
+    disabled: Array.from(disabled).sort(),
+    only: Array.from(only).sort(),
+  });
+}
+
+function writeCursorModelGroupOnly(groupIds) {
+  writeActiveConfigValue("modelGroups", { disabled: [], only: Array.from(new Set(groupIds)).sort() });
+}
+
+function resetCursorModelGroups() {
+  writeActiveConfigValue("modelGroups", { disabled: [], only: [] });
 }
 
 function writeConfigFile(config) {
@@ -2843,18 +2877,31 @@ async function configCommand(args) {
   }
   if (action === "group") {
     const verb = args[1];
-    const groupId = resolveCursorModelGroupId(args[2]);
     if (verb === "enable") {
+      const groupId = resolveCursorModelGroupId(args[2]);
       writeCursorModelGroupState(groupId, true);
       console.log(`enabled model group ${groupId}`);
       return;
     }
     if (verb === "disable") {
+      const groupId = resolveCursorModelGroupId(args[2]);
       writeCursorModelGroupState(groupId, false);
       console.log(`disabled model group ${groupId}`);
       return;
     }
-    throw new Error("Usage: sub-bridge config group <enable|disable> <group>");
+    if (verb === "only") {
+      const groupIds = resolveCursorModelGroupIds(args.slice(2));
+      if (groupIds.length === 0) throw new Error("Usage: sub-bridge config group only <group...>");
+      writeCursorModelGroupOnly(groupIds);
+      console.log(`selected model groups ${groupIds.join(", ")}`);
+      return;
+    }
+    if (verb === "reset") {
+      resetCursorModelGroups();
+      console.log("reset model groups");
+      return;
+    }
+    throw new Error("Usage: sub-bridge config group <enable|disable|only|reset> <group...>");
   }
   if (action === "set") {
     const [key, ...rest] = args.slice(1);

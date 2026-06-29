@@ -645,27 +645,47 @@ export function cursorModelGroupEntries(model) {
 
 export function normalizeModelGroupsConfig(config) {
   const disabled = Array.isArray(config?.disabled) ? config.disabled : [];
+  const only = Array.isArray(config?.only) ? config.only : [];
   return {
     disabled: Array.from(new Set(disabled.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
+    only: Array.from(new Set(only.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
   };
 }
 
 export function filterCursorModelsByGroups(models, config) {
-  const disabled = new Set(normalizeModelGroupsConfig(config).disabled);
-  if (disabled.size === 0) return Array.isArray(models) ? models : [];
-  return (Array.isArray(models) ? models : []).filter((model) =>
-    cursorModelGroupEntries(model).every((group) => !disabled.has(group.id)),
-  );
+  const groupsConfig = normalizeModelGroupsConfig(config);
+  const disabled = new Set(groupsConfig.disabled);
+  const only = new Set(groupsConfig.only);
+  if (disabled.size === 0 && only.size === 0) return Array.isArray(models) ? models : [];
+  return (Array.isArray(models) ? models : []).filter((model) => {
+    const groupIds = cursorModelGroupEntries(model).map((group) => group.id);
+    const selected = only.size === 0 || groupIds.some((groupId) => only.has(groupId));
+    const enabled = groupIds.every((groupId) => !disabled.has(groupId));
+    return selected && enabled;
+  });
 }
 
 export function summarizeCursorModelGroups(models, config) {
-  const disabled = new Set(normalizeModelGroupsConfig(config).disabled);
+  const groupsConfig = normalizeModelGroupsConfig(config);
+  const disabled = new Set(groupsConfig.disabled);
+  const only = new Set(groupsConfig.only);
+  const filtered = new Set(filterCursorModelsByGroups(models, config).map((model) => String(model?.id || "").trim()));
   const byId = new Map();
   for (const model of Array.isArray(models) ? models : []) {
+    const active = filtered.has(String(model?.id || "").trim());
     for (const group of cursorModelGroupEntries(model)) {
-      const current = byId.get(group.id) || { ...group, modelCount: 0, enabled: !disabled.has(group.id) };
+      const selected = only.size === 0 || only.has(group.id);
+      const current = byId.get(group.id) || {
+        ...group,
+        modelCount: 0,
+        activeModelCount: 0,
+        selected,
+        enabled: selected && !disabled.has(group.id),
+      };
       current.modelCount += 1;
-      current.enabled = !disabled.has(group.id);
+      if (active) current.activeModelCount += 1;
+      current.selected = selected;
+      current.enabled = selected && !disabled.has(group.id);
       byId.set(group.id, current);
     }
   }

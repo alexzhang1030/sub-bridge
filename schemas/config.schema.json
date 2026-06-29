@@ -78,6 +78,10 @@
         "disabled": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
+        },
+        "only": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
         }
       }
     },

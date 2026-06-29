@@ -288,6 +288,7 @@ test("prints help with project command names", () => {
   assert.match(output, /sub-bridge doctor/);
   assert.match(output, /sub-bridge enable/);
   assert.match(output, /sub-bridge config show/);
+  assert.match(output, /sub-bridge config group only <group\.\.\.>/);
   assert.match(output, /sub-bridge install copilot/);
 });
 
@@ -503,6 +504,36 @@ test("cursor model groups enable and disable expanded model families", () => {
     assert.match(run(["--sub", "cursor", "config", "group", "enable", "provider:anthropic"]), /enabled model group provider:anthropic/);
     const enabled = JSON.parse(run(["--sub", "cursor", "models"]));
     assert.ok(enabled.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+
+    assert.match(run(["--sub", "cursor", "config", "group", "only", "gpt-5.5"]), /selected model groups family:gpt-5.5/);
+    const onlyGpt = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(onlyGpt.data.some((model) => model.id.startsWith("gpt-5.5")));
+    assert.equal(onlyGpt.data.some((model) => model.id.startsWith("claude-haiku-4-5")), false);
+
+    const onlyGroups = JSON.parse(run(["--sub", "cursor", "config", "groups"]));
+    assert.equal(onlyGroups.find((group) => group.id === "family:gpt-5.5")?.enabled, true);
+    assert.equal(onlyGroups.find((group) => group.id === "family:claude-haiku-4-5")?.enabled, false);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "enable", "claude-haiku-4-5"]), /enabled model group family:claude-haiku-4-5/);
+    const withHaiku = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(withHaiku.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+
+    assert.match(run(["--sub", "cursor", "config", "group", "disable", "claude-haiku-4-5"]), /disabled model group family:claude-haiku-4-5/);
+    const withoutHaiku = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.equal(withoutHaiku.data.some((model) => model.id.startsWith("claude-haiku-4-5")), false);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "reset"]), /reset model groups/);
+    const reset = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(reset.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+
+    assert.match(run(["--sub", "cursor", "config", "group", "only", "provider:anthropic"]), /selected model groups provider:anthropic/);
+    const onlyAnthropic = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.ok(onlyAnthropic.data.some((model) => model.id.startsWith("claude-haiku-4-5")));
+    assert.equal(onlyAnthropic.data.some((model) => model.id.startsWith("gpt-5.5")), false);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "disable", "claude-haiku-4-5"]), /disabled model group family:claude-haiku-4-5/);
+    const providerWithFamilyExcluded = JSON.parse(run(["--sub", "cursor", "models"]));
+    assert.equal(providerWithFamilyExcluded.data.some((model) => model.id.startsWith("claude-haiku-4-5")), false);
   } finally {
     rmSync(mock.dir, { recursive: true, force: true });
   }
@@ -646,6 +677,12 @@ test("cursor model variants follow Synara base plus raw variant shape", () => {
   assert.equal(groups.find((group) => group.id === "provider:anthropic")?.modelCount, models.length);
   assert.equal(groups.find((group) => group.id === "family:claude-opus-4-8")?.enabled, false);
   assert.deepEqual(filterCursorModelsByGroups(models, { disabled: ["provider:anthropic"] }), []);
+  assert.deepEqual(filterCursorModelsByGroups(models, { only: ["family:claude-opus-4-8"] }), models);
+  assert.deepEqual(filterCursorModelsByGroups(models, { only: ["provider:openai"] }), []);
+
+  const onlyGroups = summarizeCursorModelGroups(models, { only: ["family:claude-opus-4-8"] });
+  assert.equal(onlyGroups.find((group) => group.id === "family:claude-opus-4-8")?.activeModelCount, models.length);
+  assert.equal(onlyGroups.find((group) => group.id === "provider:anthropic")?.activeModelCount, models.length);
 });
 
 test("cursor ACP surfaces reasoning, tool calls, and assistant events", async () => {
