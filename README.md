@@ -1,167 +1,127 @@
 # sub-bridge-cli
 
-Local OpenAI Responses bridge for subscription-backed coding agents.
+Local OpenAI Responses bridge for GitHub Copilot custom providers.
 
-The production target is GitHub Copilot custom providers. The bridge can route Copilot's OpenAI Responses requests to either the ChatGPT/Codex subscription backend or Cursor Agent CLI over ACP.
-
-## Commands
+## Install
 
 ```bash
-sub-bridge --profile cursor status
-sub-bridge status
-sub-bridge login
-sub-bridge logout
-sub-bridge check
+./install.sh
+```
+
+Installs `sub-bridge` to `~/.local/bin`, creates `cursor` and `codex`
+subscriptions, fetches models, and writes Copilot provider rows when
+`~/.copilot/data.db` exists.
+
+```bash
+./install.sh --start
+./install.sh --launch-agent
+./install.sh --no-copilot
+```
+
+## Start
+
+```bash
 sub-bridge start
-sub-bridge stop
-sub-bridge models
-sub-bridge config show
-sub-bridge config init
-sub-bridge config set backend cursor-acp
-sub-bridge config set reasoningEffort xhigh
-sub-bridge targets
-sub-bridge install copilot
+sub-bridge status
 ```
 
-Compatibility alias:
+`start` without `--sub` starts every configured subscription.
 
 ```bash
-sub-bridge install-copilot
+sub-bridge --sub cursor check
+sub-bridge --sub codex check
 ```
 
-## Configuration
-
-Create a config file:
+## Cursor Auth
 
 ```bash
-sub-bridge config init
+SUB_BRIDGE_CURSOR_AUTH_TOKEN=... sub-bridge --sub cursor login
 ```
 
-Default path:
+The token is stored as encrypted local state at
+`~/.local/state/sub-bridge-cli/cursor-auth/token.enc`.
+
+## Config
+
+Path:
 
 ```text
 ~/.config/sub-bridge/config.json
 ```
 
-Example:
+Shape:
 
 ```json
 {
-  "host": "127.0.0.1",
-  "port": 17876,
-  "model": "gpt-5.5",
-  "backend": "codex",
-  "reasoningEffort": "xhigh",
-  "usePi": true,
-  "piTransport": "auto",
-  "stripTools": false,
-  "cursorAcpCommand": "agent",
-  "cursorWorkspace": "/absolute/path/to/project",
-  "cursorModel": "default"
-}
-```
-
-Useful commands:
-
-```bash
-sub-bridge config path
-sub-bridge config show
-sub-bridge --profile cursor config show
-sub-bridge config set reasoningEffort max
-sub-bridge --profile cursor config set backend cursor-acp
-sub-bridge config unset reasoningEffort
-```
-
-## Profiles
-
-Profiles let multiple bridge instances run at the same time from one config file. Each profile gets its own effective config, pid file, log file, port, and Copilot provider id.
-
-```json
-{
-  "profiles": {
+  "$schema": "https://raw.githubusercontent.com/alexzhang1030/sub-bridge/main/schemas/config.schema.json",
+  "version": 1,
+  "subscriptions": {
     "cursor": {
+      "type": "cursor-acp",
+      "host": "127.0.0.1",
       "port": 17876,
-      "backend": "cursor-acp",
       "providerId": "codexsub-openai-codex",
       "providerName": "SubBridge",
-      "cursorAcpCommand": "/Users/alex/.local/bin/agent",
-      "cursorWorkspace": "/absolute/path/to/project",
-      "cursorModel": "default"
-    },
-    "codex": {
-      "port": 17877,
-      "backend": "codex",
-      "providerId": "subbridge-codex",
-      "providerName": "SubBridge Codex"
+      "models": [
+        {
+          "id": "claude-haiku-4-5",
+          "displayName": "Haiku 4.5",
+          "contextWindow": 128000,
+          "maxTokens": 128000,
+          "fastMode": false,
+          "thinking": true,
+          "reasoningEffort": "high",
+          "cursorContextWindow": "1m"
+        }
+      ]
     }
   }
 }
 ```
 
+Cursor model entries can set ACP options per model:
+
+```json
+{
+  "reasoningEffort": "high",
+  "fastMode": false,
+  "thinking": true,
+  "cursorContextWindow": "1m"
+}
+```
+
+`config init` fetches Cursor models through ACP `cursor/list_available_models`
+and keeps your per-model option overrides.
+
+Edit:
+
 ```bash
-sub-bridge --profile cursor start
-sub-bridge --profile codex start
-sub-bridge --profile cursor install copilot
-sub-bridge --profile codex install copilot
-sub-bridge --profile cursor status
-sub-bridge --profile codex status
+sub-bridge --sub cursor config init
+sub-bridge --sub codex config init
 ```
 
-## Environment Overrides
-
-Environment variables override config file values. Use them for one-off runs and automation. Existing `CODEXSUB_*` and `GPT_SUB_BRIDGE_*` variables still work where they were already supported.
+Runtime overrides stay in env vars, for example:
 
 ```bash
-SUB_BRIDGE_CONFIG=~/.config/sub-bridge/config.json
-SUB_BRIDGE_PROFILE=cursor
-SUB_BRIDGE_HOST=127.0.0.1
-SUB_BRIDGE_PORT=17876
-SUB_BRIDGE_MODEL=gpt-5.5
-SUB_BRIDGE_BACKEND=codex
-SUB_BRIDGE_REASONING_EFFORT=xhigh
-SUB_BRIDGE_USE_PI=1
-SUB_BRIDGE_PI_TRANSPORT=auto
-SUB_BRIDGE_STRIP_TOOLS=0
-SUB_BRIDGE_CURSOR_ACP_COMMAND=agent
-SUB_BRIDGE_CURSOR_WORKSPACE=/absolute/path/to/project
-SUB_BRIDGE_CURSOR_MODEL=default
+SUB_BRIDGE_CURSOR_ACP_COMMAND=/Users/alex/.local/bin/agent
+SUB_BRIDGE_CURSOR_WORKSPACE=/absolute/project
 ```
 
-The provider endpoint is:
-
-```text
-http://127.0.0.1:17876/v1
-```
-
-## GitHub Copilot
-
-Install or refresh the provider rows:
+## Copilot
 
 ```bash
 sub-bridge install copilot
 ```
 
-Then start the local bridge:
+Root install writes all subscriptions. Sub install writes one subscription:
 
 ```bash
-sub-bridge start
-sub-bridge check
+sub-bridge --sub cursor install copilot
 ```
 
-The Copilot provider uses the OpenAI Responses wire API.
-
-## Cursor
-
-Cursor backend mode keeps the Copilot provider unchanged and swaps the bridge runtime behind `/v1/responses`.
+## Development
 
 ```bash
-sub-bridge config set backend cursor-acp
-sub-bridge config set cursorAcpCommand /Users/alex/.local/bin/agent
-sub-bridge config set cursorWorkspace /absolute/path/to/project
-sub-bridge config set cursorModel default
-sub-bridge start
+npm ci
+npm run ci
 ```
-
-The Cursor backend starts `agent acp`, initializes ACP, authenticates with `cursor_login`, creates a session with `session/new`, sends Copilot input via `session/prompt`, and converts `session/update` text chunks back to OpenAI Responses SSE.
-
-Use `cursorModel=default` to let Cursor choose its configured model, or set a Cursor model id such as `sonnet-4-thinking`. Use `cursorModel=request` only when Copilot model ids match Cursor model ids.

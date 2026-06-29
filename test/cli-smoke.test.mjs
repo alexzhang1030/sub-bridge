@@ -1,14 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { responsesBodyToCursorPrompt } from "../src/cursor-acp.js";
+import { responsesBodyToCursorPrompt, runCursorAcpTurn } from "../src/cursor-acp.js";
 
 const root = new URL("..", import.meta.url).pathname;
 const cli = join(root, "src", "cli.js");
 const testConfig = join(root, `.tmp-config-${process.pid}.json`);
-const testStateDir = join(root, `.tmp-state-${process.pid}`);
 
 function run(args, env = {}) {
   return execFileSync(process.execPath, [cli, ...args], {
@@ -16,50 +16,373 @@ function run(args, env = {}) {
     env: {
       ...process.env,
       SUB_BRIDGE_CONFIG: testConfig,
-      SUB_BRIDGE_STATE_DIR: testStateDir,
       ...env,
     },
     encoding: "utf8",
   });
 }
 
+function createMockCursorAgent({ failMemoryAuth = false, availableModels = true } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "sub-bridge-cursor-agent-"));
+  const command = join(dir, "agent.mjs");
+  writeFileSync(command, `#!/usr/bin/env node
+import readline from "node:readline";
+import { appendFileSync } from "node:fs";
+
+if (process.argv[2] !== "acp") process.exit(2);
+const failMemoryAuth = ${JSON.stringify(failMemoryAuth)};
+const availableModels = ${JSON.stringify(availableModels)};
+
+const modelConfigOptions = [
+  {
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    options: [
+      { value: "cursor-fast", name: "Cursor Fast" },
+      { options: [
+        { value: "cursor-deep", name: "Cursor Deep" },
+        { value: "claude-haiku-4-5[thinking=false,context=200k,effort=high,fast=false]", name: "Haiku 4.5" }
+      ] }
+    ]
+  },
+  {
+    id: "effort",
+    name: "Effort",
+    category: "model_option",
+    type: "select",
+    currentValue: "high",
+    options: [
+      { value: "low", name: "Low" },
+      { value: "medium", name: "Medium" },
+      { value: "high", name: "High" },
+      { value: "extra-high", name: "Extra High" }
+    ]
+  },
+  {
+    id: "context",
+    name: "Context Window",
+    category: "model_config",
+    type: "select",
+    currentValue: "200k",
+    options: [
+      { value: "200k", name: "200K" },
+      { value: "1m", name: "1M" }
+    ]
+  },
+  {
+    id: "fast",
+    name: "Fast Mode",
+    category: "model_config",
+    type: "boolean",
+    currentValue: false
+  },
+  {
+    id: "thinking",
+    name: "Thinking",
+    category: "model_config",
+    type: "boolean",
+    currentValue: false
+  }
+];
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  if (request.method === "authenticate") {
+    if (failMemoryAuth && process.env.AGENT_CLI_CREDENTIAL_STORE === "memory") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: "local auth unavailable" }
+      }) + "\\n");
+      return;
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  if (request.method === "session/new") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        sessionId: "mock-session",
+        configOptions: modelConfigOptions
+      }
+    }) + "\\n");
+    return;
+  }
+  if (request.method === "cursor/list_available_models") {
+    if (!availableModels) {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+      return;
+    }
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        models: [
+          {
+            value: "gpt-5.5",
+            name: "GPT-5.5",
+            configOptions: [
+              {
+                id: "reasoning",
+                name: "Reasoning",
+                category: "model_option",
+                type: "select",
+                currentValue: "medium",
+                options: [
+                  { value: "low", name: "Low" },
+                  { value: "medium", name: "Medium" },
+                  { value: "high", name: "High" }
+                ]
+              },
+              {
+                id: "context",
+                name: "Context Window",
+                category: "model_config",
+                type: "select",
+                currentValue: "272k",
+                options: [
+                  { value: "272k", name: "272K" },
+                  { value: "1m", name: "1M" }
+                ]
+              }
+            ]
+          },
+          {
+            value: "claude-haiku-4-5",
+            name: "Haiku 4.5",
+            configOptions: modelConfigOptions.slice(1)
+          }
+        ]
+      }
+    }) + "\\n");
+    return;
+  }
+  if (request.method === "session/set_config_option") {
+    if (process.env.MOCK_CAPTURE_PATH) {
+      appendFileSync(process.env.MOCK_CAPTURE_PATH, JSON.stringify(request.params) + "\\n");
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    return;
+  }
+  if (request.method === "session/prompt") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }
+    }) + "\\n");
+    return;
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+});
+`, { mode: 0o755 });
+  chmodSync(command, 0o755);
+  return { command, dir };
+}
+
 test("prints help with project command names", () => {
   const output = run(["--help"]);
-  assert.match(output, /sub-bridge --profile <name> status/);
+  assert.match(output, /sub-bridge --sub <name> status/);
   assert.match(output, /sub-bridge status/);
+  assert.match(output, /sub-bridge doctor/);
+  assert.match(output, /sub-bridge enable/);
   assert.match(output, /sub-bridge config show/);
   assert.match(output, /sub-bridge install copilot/);
 });
 
-test("shows config path and effective config", () => {
+test("shows clean root config and sub effective config", () => {
   const output = JSON.parse(run(["config", "show"]));
   assert.equal(output.configPath, testConfig);
-  assert.equal(output.effective.host, "127.0.0.1");
-  assert.equal(output.effective.backend, "codex");
-  assert.equal(output.effective.reasoningEffort, "xhigh");
+  assert.deepEqual(Object.keys(output.file), ["$schema", "version", "subscriptions"]);
+  assert.equal(output.effective, null);
+
+  const sub = JSON.parse(run(["--sub", "codex", "config", "show"]));
+  assert.equal(sub.effective.host, "127.0.0.1");
+  assert.equal(sub.effective.type, "codex");
+  assert.equal(sub.effective.defaultModel, "gpt-5.5");
 });
 
-test("sets config values in the config file", () => {
+test("sets subscription config values in the config file", () => {
   rmSync(testConfig, { force: true });
-  assert.match(run(["config", "set", "reasoningEffort", "max"]), /set reasoningEffort/);
-  const output = JSON.parse(run(["config", "show"]));
-  assert.equal(output.file.reasoningEffort, "max");
-  assert.equal(output.effective.reasoningEffort, "max");
+  assert.match(run(["--sub", "codex", "config", "set", "providerName", "SubBridge Test"]), /set providerName/);
+  const output = JSON.parse(run(["--sub", "codex", "config", "show"]));
+  assert.equal(output.file.subscriptions.codex.providerName, "SubBridge Test");
+  assert.equal(output.effective.providerName, "SubBridge Test");
 });
 
-test("stores profile config separately", () => {
+test("stores subscription config separately with clean root keys", () => {
   rmSync(testConfig, { force: true });
-  assert.match(run(["--profile", "cursor", "config", "set", "backend", "cursor-acp"]), /set backend/);
-  assert.match(run(["config", "set", "backend", "codex"]), /set backend/);
+  assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+  assert.match(run(["--sub", "codex", "config", "set", "type", "codex"]), /set type/);
 
-  const cursor = JSON.parse(run(["config", "show", "--profile", "cursor"]));
+  const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
   const rootConfig = JSON.parse(run(["config", "show"]));
-  assert.equal(cursor.profile, "cursor");
-  assert.equal(cursor.file.profiles.cursor.backend, "cursor-acp");
-  assert.equal(cursor.effective.profile, "cursor");
-  assert.equal(cursor.effective.backend, "cursor-acp");
-  assert.equal(cursor.effective.providerId, "subbridge-cursor");
-  assert.equal(rootConfig.effective.backend, "codex");
+  assert.equal(cursor.subscription, "cursor");
+  assert.deepEqual(Object.keys(rootConfig.file), ["$schema", "version", "subscriptions"]);
+  assert.deepEqual(Object.keys(cursor.file.subscriptions.cursor), [
+    "type",
+    "host",
+    "port",
+    "models",
+    "providerId",
+    "providerName",
+  ]);
+  assert.equal(cursor.file.subscriptions.cursor.type, "cursor-acp");
+  assert.equal(cursor.effective.subscription, "cursor");
+  assert.equal(cursor.effective.type, "cursor-acp");
+  assert.equal(cursor.effective.providerId, "codexsub-openai-codex");
+  assert.equal(rootConfig.file.subscriptions.codex.type, "codex");
+});
+
+test("subscription init stores subscription metadata and models", () => {
+  rmSync(testConfig, { force: true });
+  assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+  assert.match(run(["--sub", "cursor", "config", "init"], {
+    SUB_BRIDGE_CURSOR_ACP_COMMAND: "__missing_cursor_agent__",
+  }), /wrote/);
+
+  const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+  assert.equal(cursor.file.subscriptions.cursor.type, "cursor-acp");
+  assert.deepEqual(Object.keys(cursor.file.subscriptions.cursor), [
+    "type",
+    "host",
+    "port",
+    "models",
+    "providerId",
+    "providerName",
+  ]);
+  assert.ok(Array.isArray(cursor.file.subscriptions.cursor.models));
+  assert.ok(cursor.file.subscriptions.cursor.models.some((model) => model.id === "gpt-5.5"));
+  assert.equal(cursor.effective.defaultModel, "gpt-5.5");
+});
+
+test("cursor init fetches models from ACP available models", () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "set", "models", JSON.stringify([
+      {
+        id: "claude-haiku-4-5",
+        displayName: "Haiku 4.5",
+        contextWindow: 128000,
+        maxTokens: 128000,
+        fastMode: false,
+        thinking: true,
+        cursorContextWindow: "1m",
+      },
+    ])]), /set models/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+    }), /wrote/);
+
+    const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+    assert.deepEqual(cursor.file.subscriptions.cursor.models.map((model) => model.id), [
+      "gpt-5.5",
+      "claude-haiku-4-5",
+    ]);
+    const claude = cursor.file.subscriptions.cursor.models.find((model) => model.id === "claude-haiku-4-5");
+    assert.equal(claude.fastMode, false);
+    assert.equal(claude.thinking, true);
+    assert.equal(claude.cursorContextWindow, "1m");
+    assert.equal(claude.supportsFastMode, true);
+    assert.equal(claude.supportsThinking, true);
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor init falls back to agent auth for model discovery", () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent({ failMemoryAuth: true });
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+    }), /wrote/);
+
+    const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+    assert.deepEqual(cursor.file.subscriptions.cursor.models.map((model) => model.id), [
+      "gpt-5.5",
+      "claude-haiku-4-5",
+    ]);
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor init falls back to ACP session config options", () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent({ availableModels: false });
+  try {
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor", "config", "init"], {
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+    }), /wrote/);
+
+    const cursor = JSON.parse(run(["--sub", "cursor", "config", "show"]));
+    assert.deepEqual(cursor.file.subscriptions.cursor.models.map((model) => model.id), [
+      "cursor-fast",
+      "cursor-deep",
+      "claude-haiku-4-5[thinking=false,context=200k,effort=high,fast=false]",
+    ]);
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor ACP sets requested model and per-model options", async () => {
+  const mock = createMockCursorAgent();
+  const capturePath = join(mock.dir, "capture.jsonl");
+  try {
+    await runCursorAcpTurn({
+      command: mock.command,
+      workspace: root,
+      env: {
+        ...process.env,
+        MOCK_CAPTURE_PATH: capturePath,
+      },
+      timeoutMs: 5000,
+      model: "claude-haiku-4-5",
+      modelOptions: {
+        reasoningEffort: "high",
+        fastMode: false,
+        thinking: true,
+        contextWindow: "1m",
+      },
+      body: {
+        input: [
+          {
+            role: "user",
+            content: [{ type: "input_text", text: "Say pong." }],
+          },
+        ],
+      },
+    });
+
+    const writes = readFileSync(capturePath, "utf8")
+      .trim()
+      .split(/\n/)
+      .map((line) => JSON.parse(line));
+    assert.ok(writes.some((entry) =>
+      entry.configId === "model" &&
+      entry.value === "claude-haiku-4-5[thinking=true,context=1m,effort=high,fast=false]",
+    ));
+    assert.ok(writes.some((entry) => entry.configId === "effort" && entry.value === "high"));
+    assert.ok(writes.some((entry) => entry.configId === "context" && entry.value === "1m"));
+    assert.ok(writes.some((entry) => entry.configId === "fast" && entry.value === false));
+    assert.ok(writes.some((entry) => entry.configId === "thinking" && entry.value === true));
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
 });
 
 test("lists provider targets", () => {
@@ -74,6 +397,127 @@ test("lists bridge models", () => {
   const models = JSON.parse(run(["models"]));
   assert.equal(models.object, "list");
   assert.ok(models.data.some((model) => model.id === "gpt-5.5"));
+});
+
+test("uses configured subscription model list", () => {
+  rmSync(testConfig, { force: true });
+  const configuredModels = JSON.stringify([
+    { id: "custom-model", displayName: "Custom Model", contextWindow: 1000, maxTokens: 500 },
+  ]);
+  assert.match(run(["--sub", "codex", "config", "set", "models", configuredModels]), /set models/);
+  const models = JSON.parse(run(["--sub", "codex", "models"]));
+  assert.deepEqual(models.data, [
+    {
+      id: "custom-model",
+      object: "model",
+      created: 0,
+      owned_by: "openai-codex",
+    },
+  ]);
+});
+
+test("enable starts subscription service", () => {
+  rmSync(testConfig, { force: true });
+  const port = String(21000 + (process.pid % 10000));
+  const stateDir = join(root, `.tmp-enable-state-${process.pid}`);
+  const runtimeEnv = { SUB_BRIDGE_CODEX_ENABLE_STATE_DIR: stateDir };
+
+  try {
+    assert.match(run(["--sub", "codex-enable", "config", "set", "port", port]), /set port/);
+    const output = run(["--sub", "codex-enable", "enable"], runtimeEnv);
+    assert.match(output, /started pid=/);
+    assert.match(output, /enabled subscription=codex-enable/);
+
+    const config = JSON.parse(run(["--sub", "codex-enable", "config", "show"]));
+    assert.deepEqual(Object.keys(config.file.subscriptions["codex-enable"]), [
+      "type",
+      "host",
+      "port",
+      "models",
+      "providerId",
+      "providerName",
+    ]);
+  } finally {
+    run(["--sub", "codex-enable", "stop"], runtimeEnv);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("start without sub starts all subscriptions", () => {
+  rmSync(testConfig, { force: true });
+  const stateA = join(root, `.tmp-all-state-a-${process.pid}`);
+  const stateB = join(root, `.tmp-all-state-b-${process.pid}`);
+  const portA = String(22000 + (process.pid % 10000));
+  const portB = String(23000 + (process.pid % 10000));
+  const runtimeEnv = {
+    SUB_BRIDGE_ALPHA_STATE_DIR: stateA,
+    SUB_BRIDGE_BETA_STATE_DIR: stateB,
+  };
+
+  try {
+    assert.match(run(["--sub", "alpha", "config", "set", "type", "codex"]), /set type/);
+    assert.match(run(["--sub", "alpha", "config", "set", "port", portA]), /set port/);
+    assert.match(run(["--sub", "beta", "config", "set", "type", "codex"]), /set type/);
+    assert.match(run(["--sub", "beta", "config", "set", "port", portB]), /set port/);
+
+    const output = run(["start"], runtimeEnv);
+    assert.match(output, /started pid=/);
+    const status = JSON.parse(run(["status"], runtimeEnv));
+    assert.equal(status.subscriptions.alpha.running, true);
+    assert.equal(status.subscriptions.beta.running, true);
+  } finally {
+    run(["stop"], runtimeEnv);
+    rmSync(stateA, { recursive: true, force: true });
+    rmSync(stateB, { recursive: true, force: true });
+  }
+});
+
+test("cursor login stores encrypted local token", () => {
+  rmSync(testConfig, { force: true });
+  const authDir = join(root, `.tmp-cursor-auth-${process.pid}`);
+  const stateDir = join(root, `.tmp-cursor-auth-state-${process.pid}`);
+  const token = "cursor-test-token";
+  const runtimeEnv = {
+    SUB_BRIDGE_CURSOR_AUTH_DIR: authDir,
+    SUB_BRIDGE_CURSOR_STATE_DIR: stateDir,
+    SUB_BRIDGE_CURSOR_PORT: String(24000 + (process.pid % 10000)),
+  };
+
+  try {
+    assert.match(run(["--sub", "cursor", "login"], {
+      ...runtimeEnv,
+      SUB_BRIDGE_CURSOR_AUTH_TOKEN: token,
+    }), /stored cursor auth token/);
+    const tokenPath = join(authDir, "token.enc");
+    assert.equal(existsSync(tokenPath), true);
+    assert.equal(readFileSync(tokenPath, "utf8").includes(token), false);
+    const doctor = JSON.parse(run(["--sub", "cursor", "doctor"], {
+      ...runtimeEnv,
+      SUB_BRIDGE_CURSOR_ACP_COMMAND: "__missing_cursor_agent__",
+    }));
+    assert.equal(doctor.auth.cursor.local.tokenExists, true);
+    run(["--sub", "cursor", "logout"], runtimeEnv);
+    assert.equal(existsSync(tokenPath), false);
+  } finally {
+    rmSync(authDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports local surfaces without token values", () => {
+  const output = JSON.parse(run(["doctor"], {
+    SUB_BRIDGE_PORT: "19076",
+    SUB_BRIDGE_AUTH_PATH: join(root, `.tmp-auth-${process.pid}.json`),
+    SUB_BRIDGE_COPILOT_DB: join(root, `.tmp-copilot-${process.pid}.db`),
+    SUB_BRIDGE_CURSOR_ACP_COMMAND: "__missing_cursor_agent__",
+  }));
+  assert.equal(output.subscription, null);
+  assert.equal(output.effective.baseUrl, "http://127.0.0.1:19076/v1");
+  assert.equal(output.auth.codex.exists, false);
+  assert.equal(output.auth.codex.accessTokenPresent, false);
+  assert.equal(output.copilot.exists, false);
+  assert.equal(output.tools.cursorAgent.available, false);
+  assert.equal(JSON.stringify(output).includes("access_token"), false);
 });
 
 test("converts responses input to Cursor ACP prompt blocks", () => {

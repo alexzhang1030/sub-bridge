@@ -1,5 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import {
+  collectCursorAcpConfigUpdates,
+  cursorModelsFromAvailableModels,
+  cursorModelsFromConfigOptions,
+  CURSOR_LIST_AVAILABLE_MODELS_METHOD,
+  mergeCursorModelOptions,
+  modelConfigId,
+  resolveCursorAcpModelValue,
+} from "./cursor-models.js";
 
 function isRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value);
@@ -90,73 +99,6 @@ export function responsesBodyToCursorPrompt(body) {
   prompt.push({ type: "text", text });
   prompt.push(...imageParts);
   return prompt;
-}
-
-function normalizeReasoningValue(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  switch (normalized) {
-    case "low":
-    case "medium":
-    case "high":
-    case "max":
-      return normalized;
-    case "xhigh":
-    case "extra-high":
-    case "extra high":
-      return "xhigh";
-    default:
-      return "";
-  }
-}
-
-function flattenSelectOptions(option) {
-  if (!option || option.type !== "select" || !Array.isArray(option.options)) return [];
-  return option.options.flatMap((entry) => {
-    if (typeof entry?.value === "string") return [{ value: entry.value, name: String(entry.name || entry.value) }];
-    if (Array.isArray(entry?.options)) {
-      return entry.options.flatMap((child) =>
-        typeof child?.value === "string" ? [{ value: child.value, name: String(child.name || child.value) }] : [],
-      );
-    }
-    return [];
-  });
-}
-
-function findModelConfig(configOptions) {
-  return (
-    configOptions.find((option) => option?.category === "model" && typeof option.id === "string") ||
-    configOptions.find((option) => option?.id === "model")
-  );
-}
-
-function findReasoningConfig(configOptions) {
-  return configOptions.find((option) => {
-    if (!option || option.type !== "select") return false;
-    const id = String(option.id || "").toLowerCase();
-    const name = String(option.name || "").toLowerCase();
-    return (
-      option.category === "thought_level" ||
-      option.category === "model_option" ||
-      id === "effort" ||
-      id === "reasoning" ||
-      name.includes("effort") ||
-      name.includes("reasoning")
-    );
-  });
-}
-
-function resolveReasoningOptionValue(option, requested) {
-  const normalizedRequest = normalizeReasoningValue(requested);
-  if (!normalizedRequest) return undefined;
-  for (const entry of flattenSelectOptions(option)) {
-    const value = normalizeReasoningValue(entry.value);
-    const name = normalizeReasoningValue(entry.name);
-    if (value === normalizedRequest || name === normalizedRequest) return entry.value;
-    if (normalizedRequest === "xhigh" && (entry.value === "extra-high" || entry.name.toLowerCase() === "extra high")) {
-      return entry.value;
-    }
-  }
-  return undefined;
 }
 
 function parseSessionTextDelta(message) {
@@ -360,17 +302,20 @@ async function setConfigOption(client, sessionId, configId, value) {
 
 async function configureCursorSession(client, sessionId, sessionSetup, options) {
   let configOptions = Array.isArray(sessionSetup?.configOptions) ? sessionSetup.configOptions : [];
-  const requestedModel = options.model && options.model !== "default" ? options.model : "";
-  if (requestedModel) {
-    const modelConfig = findModelConfig(configOptions);
-    const result = await setConfigOption(client, sessionId, modelConfig?.id || "model", requestedModel);
+  const requestedModel = options.model && options.model !== "default" ? options.model : "auto";
+  const modelOptions = mergeCursorModelOptions(
+    options.modelOptions,
+    options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : null,
+  );
+  const modelValue = resolveCursorAcpModelValue(configOptions, requestedModel, modelOptions);
+  if (modelValue) {
+    const result = await setConfigOption(client, sessionId, modelConfigId(configOptions), modelValue);
     if (Array.isArray(result?.configOptions)) configOptions = result.configOptions;
   }
 
-  const reasoningConfig = findReasoningConfig(configOptions);
-  const reasoningValue = resolveReasoningOptionValue(reasoningConfig, options.reasoningEffort);
-  if (reasoningConfig?.id && reasoningValue !== undefined) {
-    await setConfigOption(client, sessionId, reasoningConfig.id, reasoningValue);
+  for (const update of collectCursorAcpConfigUpdates(configOptions, modelOptions)) {
+    const result = await setConfigOption(client, sessionId, update.configId, update.value);
+    if (Array.isArray(result?.configOptions)) configOptions = result.configOptions;
   }
 }
 
@@ -426,6 +371,40 @@ export async function runCursorAcpTurn(options) {
     client.close();
   }
 
+}
+
+export async function fetchCursorAcpModels(options) {
+  const client = new CursorAcpClient(options);
+  try {
+    client.start();
+    await client.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+        _meta: { parameterizedModelPicker: true },
+      },
+      clientInfo: { name: "sub-bridge", version: "0.1.0" },
+    });
+    await client.request("authenticate", { methodId: "cursor_login" });
+    const sessionSetup = await client.request("session/new", {
+      cwd: options.workspace,
+      mcpServers: [],
+    });
+    const sessionId = sessionSetup?.sessionId;
+    if (typeof sessionId === "string" && sessionId) {
+      try {
+        const available = await client.request(CURSOR_LIST_AVAILABLE_MODELS_METHOD, { sessionId });
+        const models = cursorModelsFromAvailableModels(available?.models);
+        if (models.length > 0) return models;
+      } catch (error) {
+        options.onProtocolError?.(error);
+      }
+    }
+    return cursorModelsFromConfigOptions(sessionSetup?.configOptions);
+  } finally {
+    client.close();
+  }
 }
 
 export function makeCursorEnv({ baseEnv = process.env, forceCi = true } = {}) {

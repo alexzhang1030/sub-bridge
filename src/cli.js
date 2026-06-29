@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -14,8 +15,14 @@ import {
 import { homedir, platform, release, arch } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
-import { cursorAbout, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { cursorAbout, fetchCursorAcpModels, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
+import {
+  cursorOptionsFromModelEntry,
+  mergeCursorModelOptions,
+  parseCursorCliModelList,
+  stripCursorParameterizedSuffix,
+} from "./cursor-models.js";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -24,6 +31,8 @@ const CODEX_RESPONSES_PATH = "/codex/responses";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 
 const CLI_NAME = "sub-bridge";
+const CONFIG_VERSION = 1;
+const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/alexzhang1030/sub-bridge/main/schemas/config.schema.json";
 
 function envValue(...keys) {
   for (const key of keys) {
@@ -33,28 +42,28 @@ function envValue(...keys) {
 }
 
 function parseGlobalArgs(argv) {
-  let profile = envValue("SUB_BRIDGE_PROFILE") || "";
+  let sub = envValue("SUB_BRIDGE_SUB") || "";
   const args = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--profile") {
+    if (arg === "--sub") {
       const value = argv[index + 1];
-      if (!value) throw new Error("--profile requires a value");
-      profile = value;
+      if (!value) throw new Error(`${arg} requires a value`);
+      sub = value;
       index += 1;
       continue;
     }
-    if (arg.startsWith("--profile=")) {
-      profile = arg.slice("--profile=".length);
+    if (arg.startsWith("--sub=")) {
+      sub = arg.slice("--sub=".length);
       continue;
     }
     args.push(arg);
   }
-  return { profile: profile.trim(), args };
+  return { sub: sub.trim(), args };
 }
 
 const GLOBAL_ARGS = parseGlobalArgs(process.argv.slice(2));
-const PROFILE_NAME = GLOBAL_ARGS.profile;
+const SUB_NAME = GLOBAL_ARGS.sub;
 
 function slug(value) {
   return String(value || "")
@@ -72,6 +81,57 @@ function titleCase(value) {
     .join(" ");
 }
 
+function subEnvKey(suffix) {
+  const name = slug(SUB_NAME).replace(/-/g, "_").toUpperCase();
+  return name ? `SUB_BRIDGE_${name}_${suffix}` : "";
+}
+
+function envKeysForSub(suffix, fallbackKeys = []) {
+  return [subEnvKey(suffix), ...fallbackKeys].filter(Boolean);
+}
+
+function defaultTypeForSub(subName) {
+  return slug(subName) === "cursor" ? "cursor-acp" : "codex";
+}
+
+function defaultPortForSub(subName, type) {
+  const normalizedSub = slug(subName);
+  const normalizedType = type === "cursor" ? "cursor-acp" : type;
+  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return 17876;
+  if (normalizedSub === "codex" || normalizedType === "codex") return 17877;
+  return 17876;
+}
+
+function defaultProviderId(subName, type) {
+  const normalizedSub = slug(subName);
+  const normalizedType = type === "cursor" ? "cursor-acp" : type;
+  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return "codexsub-openai-codex";
+  if (normalizedSub === "codex" || normalizedType === "codex") return "subbridge-codex";
+  return `subbridge-${normalizedSub || "default"}`;
+}
+
+function defaultProviderName(subName, type) {
+  const normalizedSub = slug(subName);
+  const normalizedType = type === "cursor" ? "cursor-acp" : type;
+  if (normalizedSub === "cursor" || normalizedType === "cursor-acp") return "SubBridge";
+  if (normalizedSub === "codex" || normalizedType === "codex") return "SubBridge Codex";
+  return `SubBridge ${titleCase(normalizedSub || "default")}`;
+}
+
+function defaultCursorAcpCommand() {
+  const localAgent = join(homedir(), ".local", "bin", "agent");
+  return existsSync(localAgent) ? localAgent : "agent";
+}
+
+const SUBSCRIPTION_CONFIG_KEYS = new Set([
+  "type",
+  "host",
+  "port",
+  "models",
+  "providerId",
+  "providerName",
+]);
+
 const CONFIG_PATH =
   envValue("SUB_BRIDGE_CONFIG", "CODEXSUB_CONFIG") || join(homedir(), ".config", "sub-bridge", "config.json");
 
@@ -86,18 +146,44 @@ function readConfigFile(path = CONFIG_PATH) {
 
 const CONFIG_FILE = readConfigFile();
 
-function activeConfig(configFile, profileName) {
-  const base = { ...configFile };
-  delete base.profiles;
-  if (!profileName) return base;
-  const profile = configFile.profiles?.[profileName];
+function isPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeSubscriptionConfig(subscription) {
+  const next = {};
+  if (!isPlainObject(subscription)) return next;
+  for (const key of SUBSCRIPTION_CONFIG_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(subscription, key)) next[key] = subscription[key];
+  }
+  return next;
+}
+
+function subscriptionsFromConfig(configFile) {
+  const source = isPlainObject(configFile?.subscriptions) ? configFile.subscriptions : {};
+  const subscriptions = {};
+  for (const [name, subscription] of Object.entries(source)) {
+    if (!isPlainObject(subscription)) continue;
+    subscriptions[name] = normalizeSubscriptionConfig(subscription);
+  }
+  return subscriptions;
+}
+
+function configDocument(subscriptions = subscriptionsFromConfig(CONFIG_FILE)) {
   return {
-    ...base,
-    ...(profile && typeof profile === "object" && !Array.isArray(profile) ? profile : {}),
+    $schema: CONFIG_SCHEMA_URL,
+    version: CONFIG_VERSION,
+    subscriptions,
   };
 }
 
-const CONFIG = activeConfig(CONFIG_FILE, PROFILE_NAME);
+function activeConfig(configFile, subName) {
+  if (!subName) return {};
+  const subscription = subscriptionsFromConfig(configFile)[subName];
+  return normalizeSubscriptionConfig(subscription);
+}
+
+const CONFIG = activeConfig(CONFIG_FILE, SUB_NAME);
 
 function configValue(key, envKeys, fallback) {
   const env = envValue(...envKeys);
@@ -113,25 +199,47 @@ function configNumber(key, envKeys, fallback) {
   return number;
 }
 
+function configBoolean(key, envKeys, fallback) {
+  const value = configValue(key, envKeys, fallback);
+  const normalized = String(value).toLowerCase();
+  return !["0", "false", "no", "off"].includes(normalized);
+}
+
+const BACKEND = configValue("type", envKeysForSub("TYPE", ["SUB_BRIDGE_TYPE"]), defaultTypeForSub(SUB_NAME));
 const AUTH_PATH =
-  configValue("authPath", ["SUB_BRIDGE_AUTH_PATH", "CODEXSUB_AUTH_PATH"], join(homedir(), ".codex", "auth.json"));
+  configValue(
+    "authPath",
+    envKeysForSub("AUTH_PATH", ["SUB_BRIDGE_AUTH_PATH", "CODEXSUB_AUTH_PATH"]),
+    join(homedir(), ".codex", "auth.json"),
+  );
 const COPILOT_DB =
-  configValue("copilotDb", ["SUB_BRIDGE_COPILOT_DB", "CODEXSUB_COPILOT_DB"], join(homedir(), ".copilot", "data.db"));
-const HOST = configValue("host", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"], "127.0.0.1");
-const PORT = configNumber("port", ["SUB_BRIDGE_PORT", "CODEXSUB_PORT"], 17876);
-const DEFAULT_MODEL = configValue("model", ["SUB_BRIDGE_MODEL", "CODEXSUB_MODEL"], "gpt-5.5");
-const BACKEND = configValue("backend", ["SUB_BRIDGE_BACKEND"], "codex");
-const BRIDGE_KEY = configValue("bridgeKey", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"], "");
-const ORIGINATOR = configValue("originator", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB_ORIGINATOR"], "pi");
+  configValue(
+    "copilotDb",
+    envKeysForSub("COPILOT_DB", ["SUB_BRIDGE_COPILOT_DB", "CODEXSUB_COPILOT_DB"]),
+    join(homedir(), ".copilot", "data.db"),
+  );
+const HOST = configValue("host", envKeysForSub("HOST", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"]), "127.0.0.1");
+const PORT = configNumber(
+  "port",
+  envKeysForSub("PORT", ["SUB_BRIDGE_PORT", "CODEXSUB_PORT"]),
+  defaultPortForSub(SUB_NAME, BACKEND),
+);
+const DEFAULT_MODEL_OVERRIDE = envValue(...envKeysForSub("MODEL", ["SUB_BRIDGE_MODEL", "CODEXSUB_MODEL"]));
+const BRIDGE_KEY = configValue("bridgeKey", envKeysForSub("KEY", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"]), "");
+const ORIGINATOR = configValue(
+  "originator",
+  envKeysForSub("ORIGINATOR", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB_ORIGINATOR"]),
+  "pi",
+);
 const PROVIDER_ID = configValue(
   "providerId",
-  ["SUB_BRIDGE_PROVIDER_ID", "CODEXSUB_PROVIDER_ID"],
-  PROFILE_NAME ? `subbridge-${slug(PROFILE_NAME)}` : "codexsub-openai-codex",
+  envKeysForSub("PROVIDER_ID", ["SUB_BRIDGE_PROVIDER_ID", "CODEXSUB_PROVIDER_ID"]),
+  defaultProviderId(SUB_NAME, BACKEND),
 );
 const PROVIDER_NAME = configValue(
   "providerName",
-  ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"],
-  PROFILE_NAME ? `SubBridge ${titleCase(PROFILE_NAME)}` : "SubBridge",
+  envKeysForSub("PROVIDER_NAME", ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"]),
+  defaultProviderName(SUB_NAME, BACKEND),
 );
 const LEGACY_STATE_DIR = join(homedir(), ".local", "state", "gpt-sub-bridge");
 const DEFAULT_STATE_DIR = join(homedir(), ".local", "state", "sub-bridge-cli");
@@ -139,23 +247,28 @@ const USE_LEGACY_STATE = existsSync(join(LEGACY_STATE_DIR, "gpt-sub-bridge.pid")
 const STATE_DIR =
   configValue(
     "stateDir",
-    ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"],
-    PROFILE_NAME ? join(DEFAULT_STATE_DIR, slug(PROFILE_NAME)) : USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR,
+    envKeysForSub("STATE_DIR", ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"]),
+    SUB_NAME ? join(DEFAULT_STATE_DIR, slug(SUB_NAME)) : USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR,
   );
 const PID_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.pid" : "sub-bridge.pid";
 const LOG_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.log" : "sub-bridge.log";
-const PID_PATH = configValue("pidPath", ["SUB_BRIDGE_PID_PATH", "CODEXSUB_PID_PATH"], join(STATE_DIR, PID_FILE_NAME));
-const LOG_PATH = configValue("logPath", ["SUB_BRIDGE_LOG_PATH", "CODEXSUB_LOG_PATH"], join(STATE_DIR, LOG_FILE_NAME));
+const PID_PATH = configValue(
+  "pidPath",
+  envKeysForSub("PID_PATH", ["SUB_BRIDGE_PID_PATH", "CODEXSUB_PID_PATH"]),
+  join(STATE_DIR, PID_FILE_NAME),
+);
+const LOG_PATH = configValue(
+  "logPath",
+  envKeysForSub("LOG_PATH", ["SUB_BRIDGE_LOG_PATH", "CODEXSUB_LOG_PATH"]),
+  join(STATE_DIR, LOG_FILE_NAME),
+);
 const REASONING_EFFORT =
-  configValue(
-    "reasoningEffort",
-    ["SUB_BRIDGE_REASONING_EFFORT", "GPT_SUB_BRIDGE_REASONING_EFFORT", "CODEXSUB_REASONING_EFFORT"],
-    "xhigh",
-  );
-const USE_PI_SETTING = String(
-  configValue("usePi", ["SUB_BRIDGE_USE_PI", "GPT_SUB_BRIDGE_USE_PI", "CODEXSUB_USE_PI"], "1"),
-).toLowerCase();
-const USE_PI_WRAPPER = !["0", "false", "no", "off"].includes(USE_PI_SETTING);
+  envValue(...envKeysForSub("REASONING_EFFORT", [
+    "SUB_BRIDGE_REASONING_EFFORT",
+    "GPT_SUB_BRIDGE_REASONING_EFFORT",
+    "CODEXSUB_REASONING_EFFORT",
+  ])) || "xhigh";
+const USE_PI_WRAPPER = configBoolean("usePi", ["SUB_BRIDGE_USE_PI", "GPT_SUB_BRIDGE_USE_PI", "CODEXSUB_USE_PI"], "1");
 const LEGACY_PI_RUNTIME_DIR = join(homedir(), ".local", "share", "gpt-sub-bridge");
 const PI_RUNTIME_DIR =
   configValue(
@@ -165,33 +278,40 @@ const PI_RUNTIME_DIR =
   );
 const PI_TRANSPORT = configValue("piTransport", ["SUB_BRIDGE_PI_TRANSPORT", "GPT_SUB_BRIDGE_PI_TRANSPORT"], "auto");
 const PI_TIMEOUT_MS = configNumber("timeoutMs", ["SUB_BRIDGE_TIMEOUT_MS", "GPT_SUB_BRIDGE_TIMEOUT_MS"], 600000);
-const STRIP_TOOLS_SETTING = String(
-  configValue(
-    "stripTools",
-    ["SUB_BRIDGE_STRIP_TOOLS", "GPT_SUB_BRIDGE_STRIP_TOOLS", "CODEXSUB_STRIP_TOOLS"],
-    USE_PI_WRAPPER ? "0" : "1",
-  ),
-).toLowerCase();
-const STRIP_COPILOT_TOOLS = !["0", "false", "no", "off"].includes(STRIP_TOOLS_SETTING);
+const STRIP_COPILOT_TOOLS = configBoolean(
+  "stripTools",
+  ["SUB_BRIDGE_STRIP_TOOLS", "GPT_SUB_BRIDGE_STRIP_TOOLS", "CODEXSUB_STRIP_TOOLS"],
+  USE_PI_WRAPPER ? "0" : "1",
+);
 const BASE_URL = `http://${HOST}:${PORT}/v1`;
 const HEALTH_URL = `http://${HOST}:${PORT}/healthz`;
 const CURSOR_ACP_COMMAND = configValue(
   "cursorAcpCommand",
-  ["SUB_BRIDGE_CURSOR_ACP_COMMAND"],
-  "agent",
+  envKeysForSub("CURSOR_ACP_COMMAND", ["SUB_BRIDGE_CURSOR_ACP_COMMAND"]),
+  defaultCursorAcpCommand(),
 );
-const CURSOR_API_ENDPOINT = configValue("cursorApiEndpoint", ["SUB_BRIDGE_CURSOR_API_ENDPOINT"], "");
-const CURSOR_WORKSPACE = configValue("cursorWorkspace", ["SUB_BRIDGE_CURSOR_WORKSPACE"], process.cwd());
-const CURSOR_MODEL = configValue("cursorModel", ["SUB_BRIDGE_CURSOR_MODEL"], "default");
+const CURSOR_API_ENDPOINT = configValue(
+  "cursorApiEndpoint",
+  envKeysForSub("CURSOR_API_ENDPOINT", ["SUB_BRIDGE_CURSOR_API_ENDPOINT"]),
+  "",
+);
+const CURSOR_WORKSPACE = configValue(
+  "cursorWorkspace",
+  envKeysForSub("CURSOR_WORKSPACE", ["SUB_BRIDGE_CURSOR_WORKSPACE"]),
+  process.cwd(),
+);
+const CURSOR_MODEL = configValue("cursorModel", envKeysForSub("CURSOR_MODEL", ["SUB_BRIDGE_CURSOR_MODEL"]), "request");
 const CURSOR_ACP_TIMEOUT_MS = configNumber(
   "cursorAcpTimeoutMs",
-  ["SUB_BRIDGE_CURSOR_ACP_TIMEOUT_MS"],
+  envKeysForSub("CURSOR_ACP_TIMEOUT_MS", ["SUB_BRIDGE_CURSOR_ACP_TIMEOUT_MS"]),
   600000,
 );
-const CURSOR_FORCE_CI_SETTING = String(
-  configValue("cursorForceCi", ["SUB_BRIDGE_CURSOR_FORCE_CI"], "1"),
-).toLowerCase();
-const CURSOR_FORCE_CI = !["0", "false", "no", "off"].includes(CURSOR_FORCE_CI_SETTING);
+const CURSOR_FORCE_CI = configBoolean("cursorForceCi", envKeysForSub("CURSOR_FORCE_CI", ["SUB_BRIDGE_CURSOR_FORCE_CI"]), "0");
+const CURSOR_LOCAL_AUTH_DIR =
+  envValue(...envKeysForSub("CURSOR_AUTH_DIR", ["SUB_BRIDGE_CURSOR_AUTH_DIR"])) ||
+  join(DEFAULT_STATE_DIR, "cursor-auth");
+const CURSOR_LOCAL_AUTH_KEY_PATH = join(CURSOR_LOCAL_AUTH_DIR, "key");
+const CURSOR_LOCAL_AUTH_TOKEN_PATH = join(CURSOR_LOCAL_AUTH_DIR, "token.enc");
 let piRuntimePromise = null;
 
 function logLine(message, fields = {}) {
@@ -199,7 +319,7 @@ function logLine(message, fields = {}) {
   console.log(`${new Date().toISOString()} ${message}${suffix}`);
 }
 
-const MODELS = [
+const BUILTIN_MODELS = [
   {
     id: "gpt-5.5",
     displayName: "SubBridge GPT-5.5",
@@ -226,13 +346,132 @@ const MODELS = [
   },
 ];
 
+function normalizeModelEntry(model) {
+  if (!model || typeof model !== "object") return null;
+  const rawId = model.id || model.slug || model.value || model.modelId || model.name;
+  const id = typeof rawId === "string" && rawId.trim() ? rawId.trim() : "";
+  if (!id) return null;
+  const entry = {
+    id,
+    displayName:
+      typeof model.displayName === "string" && model.displayName.trim()
+        ? model.displayName.trim()
+        : typeof model.name === "string" && model.name.trim()
+          ? model.name.trim()
+        : `SubBridge ${id}`,
+    contextWindow: Number.isFinite(Number(model.contextWindow)) ? Number(model.contextWindow) : 128000,
+    maxTokens: Number.isFinite(Number(model.maxTokens)) ? Number(model.maxTokens) : 128000,
+  };
+  for (const key of [
+    "reasoningEffort",
+    "defaultReasoningEffort",
+    "cursorContextWindow",
+    "cursorContext",
+    "contextOption",
+    "defaultContextWindow",
+    "cursorModel",
+    "upstreamProviderId",
+    "upstreamProviderName",
+  ]) {
+    if (typeof model[key] === "string" && model[key].trim()) entry[key] = model[key].trim();
+  }
+  for (const key of ["fastMode", "thinking", "supportsFastMode"]) {
+    if (typeof model[key] === "boolean") entry[key] = model[key];
+  }
+  const supportsThinking = model.supportsThinking ?? model.supportsThinkingToggle;
+  if (typeof supportsThinking === "boolean") entry.supportsThinking = supportsThinking;
+  if (Array.isArray(model.supportedReasoningEfforts)) {
+    entry.supportedReasoningEfforts = model.supportedReasoningEfforts
+      .map((item) => {
+        if (typeof item === "string") return { value: item, label: item };
+        if (!item || typeof item !== "object" || !item.value) return null;
+        return {
+          value: String(item.value),
+          label: String(item.label || item.value),
+          ...(item.isDefault === true ? { isDefault: true } : {}),
+        };
+      })
+      .filter(Boolean);
+  }
+  if (Array.isArray(model.contextWindowOptions)) {
+    entry.contextWindowOptions = model.contextWindowOptions
+      .map((item) => {
+        if (typeof item === "string") return { value: item, label: item.toUpperCase() };
+        if (!item || typeof item !== "object" || !item.value) return null;
+        return {
+          value: String(item.value),
+          label: String(item.label || item.value),
+          ...(item.isDefault === true ? { isDefault: true } : {}),
+        };
+      })
+      .filter(Boolean);
+  }
+  return entry;
+}
+
+function normalizeModelList(models) {
+  if (!Array.isArray(models)) return [];
+  const seen = new Set();
+  const normalized = [];
+  for (const model of models) {
+    const entry = normalizeModelEntry(model);
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    normalized.push(entry);
+  }
+  return normalized;
+}
+
+function activeModels() {
+  const configured = normalizeModelList(CONFIG.models);
+  return configured.length > 0 ? configured : BUILTIN_MODELS;
+}
+
+const MODELS = activeModels();
+
+function defaultModelFromModels() {
+  const override = String(DEFAULT_MODEL_OVERRIDE || "").trim();
+  if (override) {
+    let value = override;
+    if (value.includes("#")) value = value.slice(value.lastIndexOf("#") + 1);
+    if (value.includes("/")) value = value.slice(value.lastIndexOf("/") + 1);
+    if (value.startsWith("codexsub:")) value = value.slice("codexsub:".length);
+    return value || MODELS[0]?.id || BUILTIN_MODELS[0].id;
+  }
+  return MODELS[0]?.id || BUILTIN_MODELS[0].id;
+}
+
+const DEFAULT_MODEL = defaultModelFromModels();
+
+function modelConfigFor(modelId) {
+  const normalized = normalizeModelId(modelId);
+  const base = stripCursorParameterizedSuffix(normalized);
+  return (
+    MODELS.find((model) => model.id === normalized) ||
+    MODELS.find((model) => stripCursorParameterizedSuffix(model.id) === base) ||
+    null
+  );
+}
+
+function reasoningEffortForModel(modelId) {
+  return modelConfigFor(modelId)?.reasoningEffort || REASONING_EFFORT;
+}
+
+function cursorOptionsForModel(modelId, body) {
+  const modelConfig = modelConfigFor(modelId);
+  const bodyReasoning = body?.reasoning?.effort ? { reasoningEffort: body.reasoning.effort } : null;
+  return mergeCursorModelOptions(cursorOptionsFromModelEntry(modelConfig), bodyReasoning);
+}
+
 function usage(exitCode = 0) {
   console.log(`Usage:
-  ${CLI_NAME} --profile <name> status
+  ${CLI_NAME} --sub <name> status
   ${CLI_NAME} status
   ${CLI_NAME} login
   ${CLI_NAME} logout
   ${CLI_NAME} check
+  ${CLI_NAME} doctor
+  ${CLI_NAME} enable
   ${CLI_NAME} start
   ${CLI_NAME} stop
   ${CLI_NAME} models
@@ -249,23 +488,17 @@ Aliases:
 
 Environment:
   SUB_BRIDGE_CONFIG=${CONFIG_PATH}
-  SUB_BRIDGE_PROFILE=${PROFILE_NAME || "optional-profile"}
-  SUB_BRIDGE_PORT=17876
-  SUB_BRIDGE_HOST=127.0.0.1
+  SUB_BRIDGE_SUB=${SUB_NAME || "optional-sub"}
+  SUB_BRIDGE_<SUB>_PORT=17876
+  SUB_BRIDGE_<SUB>_HOST=127.0.0.1
   SUB_BRIDGE_MODEL=gpt-5.5
-  SUB_BRIDGE_BACKEND=codex|cursor-acp
-  SUB_BRIDGE_AUTH_PATH=${AUTH_PATH}
+  SUB_BRIDGE_TYPE=codex|cursor-acp
   SUB_BRIDGE_KEY=optional-local-key
-  SUB_BRIDGE_COPILOT_DB=${COPILOT_DB}
-  SUB_BRIDGE_STATE_DIR=${STATE_DIR}
-  SUB_BRIDGE_STRIP_TOOLS=0
   SUB_BRIDGE_REASONING_EFFORT=xhigh
-  SUB_BRIDGE_USE_PI=1
-  SUB_BRIDGE_PI_DIR=${PI_RUNTIME_DIR}
-  SUB_BRIDGE_PI_TRANSPORT=auto
   SUB_BRIDGE_CURSOR_ACP_COMMAND=${CURSOR_ACP_COMMAND}
   SUB_BRIDGE_CURSOR_WORKSPACE=${CURSOR_WORKSPACE}
-  SUB_BRIDGE_CURSOR_MODEL=${CURSOR_MODEL}
+  SUB_BRIDGE_CURSOR_MODEL=request
+  SUB_BRIDGE_CURSOR_AUTH_TOKEN=cursor-token
 `);
   process.exit(exitCode);
 }
@@ -276,6 +509,101 @@ function readJson(path) {
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+function ensurePrivateDir(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(path, 0o700);
+  } catch {}
+}
+
+function readOrCreateCursorAuthKey() {
+  ensurePrivateDir(CURSOR_LOCAL_AUTH_DIR);
+  if (existsSync(CURSOR_LOCAL_AUTH_KEY_PATH)) {
+    const key = Buffer.from(readFileSync(CURSOR_LOCAL_AUTH_KEY_PATH, "utf8").trim(), "base64");
+    if (key.length === 32) return key;
+  }
+  const key = randomBytes(32);
+  writeFileSync(CURSOR_LOCAL_AUTH_KEY_PATH, `${key.toString("base64")}\n`, { mode: 0o600 });
+  try {
+    chmodSync(CURSOR_LOCAL_AUTH_KEY_PATH, 0o600);
+  } catch {}
+  return key;
+}
+
+function saveCursorAuthToken(token) {
+  const cleanToken = String(token || "").trim();
+  if (!cleanToken) throw new Error("Cursor token is empty");
+  const key = readOrCreateCursorAuthKey();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(cleanToken, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  writeJson(CURSOR_LOCAL_AUTH_TOKEN_PATH, {
+    version: 1,
+    algorithm: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    tag: tag.toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  });
+  try {
+    chmodSync(CURSOR_LOCAL_AUTH_TOKEN_PATH, 0o600);
+  } catch {}
+}
+
+function loadCursorAuthToken() {
+  const envToken = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
+  if (envToken && String(envToken).trim()) return String(envToken).trim();
+  if (!existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH)) return "";
+  const payload = readJson(CURSOR_LOCAL_AUTH_TOKEN_PATH);
+  const key = readOrCreateCursorAuthKey();
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(payload.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(payload.ciphertext, "base64")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+function cursorAuthTokenPresent() {
+  const envToken = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
+  return Boolean(envToken && String(envToken).trim()) || existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH);
+}
+
+function removeCursorAuthToken() {
+  try {
+    unlinkSync(CURSOR_LOCAL_AUTH_TOKEN_PATH);
+  } catch {}
+}
+
+function cursorLocalEnvDirs() {
+  return {
+    configDir: join(CURSOR_LOCAL_AUTH_DIR, "config"),
+    dataDir: join(CURSOR_LOCAL_AUTH_DIR, "data"),
+    xdgConfigHome: join(CURSOR_LOCAL_AUTH_DIR, "xdg-config"),
+  };
+}
+
+function makeBridgeCursorEnv({ includeToken = true } = {}) {
+  const dirs = cursorLocalEnvDirs();
+  for (const path of Object.values(dirs)) ensurePrivateDir(path);
+  const env = makeCursorEnv({ forceCi: CURSOR_FORCE_CI });
+  env.AGENT_CLI_CREDENTIAL_STORE = "memory";
+  env.CURSOR_CONFIG_DIR = dirs.configDir;
+  env.CURSOR_DATA_DIR = dirs.dataDir;
+  env.XDG_CONFIG_HOME = dirs.xdgConfigHome;
+  if (includeToken) {
+    const token = loadCursorAuthToken();
+    if (token) env.CURSOR_AUTH_TOKEN = token;
+  }
+  return env;
+}
+
+function makeCursorRuntimeEnv() {
+  return cursorAuthTokenPresent()
+    ? makeBridgeCursorEnv()
+    : makeCursorEnv({ forceCi: CURSOR_FORCE_CI });
 }
 
 function decodeBase64Url(value) {
@@ -651,9 +979,10 @@ async function collectPiResponse({ provider, model, context, token, sessionId, b
   const openItems = new Map();
   let finalMessage = null;
   let stopReason = "stop";
+  const effectiveReasoningEffort = body.reasoning?.effort || reasoningEffortForModel(model.id);
   const piStream = provider.stream(model, context, {
     apiKey: token,
-    reasoningEffort: REASONING_EFFORT,
+    reasoningEffort: effectiveReasoningEffort,
     reasoningSummary: "auto",
     textVerbosity: body.text?.verbosity || "low",
     sessionId,
@@ -795,12 +1124,13 @@ function normalizeRequestBody(bodyText) {
   body.model = normalizeModelId(body.model);
   if (body.store === undefined) body.store = false;
   if (body.stream === undefined) body.stream = true;
-  if (REASONING_EFFORT) {
+  const effectiveReasoningEffort = reasoningEffortForModel(body.model);
+  if (effectiveReasoningEffort) {
     const currentReasoning =
       body.reasoning && typeof body.reasoning === "object" && !Array.isArray(body.reasoning)
         ? body.reasoning
         : {};
-    body.reasoning = { ...currentReasoning, effort: REASONING_EFFORT };
+    body.reasoning = { ...currentReasoning, effort: effectiveReasoningEffort };
   }
 
   const strippedParams = [];
@@ -899,7 +1229,7 @@ async function forwardResponsesPi(req, res, bodyText) {
     toolsOut,
     strippedTools: false,
     strippedParams: normalized.info.strippedParams,
-    reasoningEffort: REASONING_EFFORT,
+    reasoningEffort: normalized.info.reasoningEffort,
     runtime: "pi",
     transport: PI_TRANSPORT,
   });
@@ -962,7 +1292,7 @@ async function forwardResponsesPi(req, res, bodyText) {
   try {
     piStream = provider.stream(model, context, {
       apiKey: token,
-      reasoningEffort: REASONING_EFFORT,
+      reasoningEffort: body.reasoning?.effort || reasoningEffortForModel(model.id),
       reasoningSummary: "auto",
       textVerbosity: body.text?.verbosity || "low",
       sessionId,
@@ -1288,13 +1618,21 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
   upstreamStream.pipe(res);
 }
 
+function resolveCursorAcpModel(requestModel) {
+  const modelConfig = modelConfigFor(requestModel);
+  const configured = String(modelConfig?.cursorModel || CURSOR_MODEL || "request").trim();
+  if (!configured || configured === "request") return requestModel;
+  if (configured === "auto" || configured === "default") return "default";
+  return configured;
+}
+
 async function forwardResponsesCursorAcp(req, res, bodyText) {
   const startedAt = Date.now();
   const normalized = normalizeRequestBody(bodyText);
   const body = JSON.parse(normalized.body);
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
   const output = [];
-  const actualCursorModel = CURSOR_MODEL === "request" ? body.model : CURSOR_MODEL;
+  const actualCursorModel = resolveCursorAcpModel(body.model);
 
   logLine("responses.forward", {
     path: req.url,
@@ -1306,7 +1644,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     toolsOut: 0,
     strippedTools: normalized.info.strippedTools,
     strippedParams: normalized.info.strippedParams,
-    reasoningEffort: REASONING_EFFORT,
+    reasoningEffort: normalized.info.reasoningEffort,
     runtime: "cursor-acp",
     command: CURSOR_ACP_COMMAND,
     workspace: CURSOR_WORKSPACE,
@@ -1316,10 +1654,11 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     command: CURSOR_ACP_COMMAND,
     apiEndpoint: CURSOR_API_ENDPOINT || undefined,
     workspace: CURSOR_WORKSPACE,
-    env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+    env: makeCursorRuntimeEnv(),
     timeoutMs: CURSOR_ACP_TIMEOUT_MS,
     model: actualCursorModel,
-    reasoningEffort: REASONING_EFFORT,
+    reasoningEffort: reasoningEffortForModel(body.model),
+    modelOptions: cursorOptionsForModel(body.model, body),
     body,
     onStderr: (chunk) => {
       const text = String(chunk || "").trim();
@@ -1523,14 +1862,14 @@ function startServer() {
         if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
           const about = cursorAbout({
             command: CURSOR_ACP_COMMAND,
-            env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
+            env: makeCursorRuntimeEnv(),
             timeoutMs: 8000,
           });
           json(res, 200, {
             ok: true,
             provider: PROVIDER_NAME,
             runtime: "cursor-acp",
-            backend: BACKEND,
+            type: BACKEND,
             default_model: DEFAULT_MODEL,
             cursor_command: CURSOR_ACP_COMMAND,
             cursor_workspace: CURSOR_WORKSPACE,
@@ -1544,7 +1883,7 @@ function startServer() {
           ok: true,
           provider: PROVIDER_NAME,
           runtime: USE_PI_WRAPPER ? "pi" : "direct",
-          backend: BACKEND,
+          type: BACKEND,
           pi_runtime_dir: USE_PI_WRAPPER ? PI_RUNTIME_DIR : null,
           pi_transport: USE_PI_WRAPPER ? PI_TRANSPORT : null,
           default_model: DEFAULT_MODEL,
@@ -1594,7 +1933,7 @@ function startServer() {
     console.log(`${CLI_NAME} listening on http://${HOST}:${PORT}`);
     console.log(`provider base URL: ${BASE_URL}`);
     console.log(`wireApi: responses`);
-    console.log(`backend: ${BACKEND}`);
+    console.log(`type: ${BACKEND}`);
   });
 }
 
@@ -1624,6 +1963,48 @@ function removePidFile() {
   } catch {}
 }
 
+function allSubscriptionNames() {
+  return Object.keys(subscriptionsFromConfig(CONFIG_FILE));
+}
+
+function requireSubscriptions() {
+  const subscriptions = allSubscriptionNames();
+  if (subscriptions.length === 0) throw new Error(`No subscriptions configured in ${CONFIG_PATH}`);
+  return subscriptions;
+}
+
+function runSubscriptionCommand(subscriptionName, commandName) {
+  const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, commandName], {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if ((result.status ?? 1) !== 0) process.exitCode = result.status ?? 1;
+}
+
+function runSubscriptionCommandJson(subscriptionName, commandName) {
+  const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, commandName], {
+    encoding: "utf8",
+    env: process.env,
+  });
+  if ((result.status ?? 1) !== 0) {
+    return {
+      ok: false,
+      status: result.status ?? null,
+      error: result.stderr || result.error?.message || result.stdout || "subscription command failed",
+    };
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return {
+      ok: false,
+      status: result.status ?? null,
+      error: "subscription command returned invalid JSON",
+      stdout: result.stdout,
+    };
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url);
   const text = await response.text();
@@ -1637,6 +2018,15 @@ async function fetchJson(url) {
 }
 
 async function statusCommand() {
+  if (!SUB_NAME) {
+    const statuses = {};
+    for (const subscription of requireSubscriptions()) {
+      statuses[subscription] = runSubscriptionCommandJson(subscription, "status");
+    }
+    console.log(JSON.stringify({ subscriptions: statuses }, null, 2));
+    return;
+  }
+
   const pid = readPid();
   const pidRunning = pid ? isPidRunning(pid) : false;
   let health = null;
@@ -1647,11 +2037,11 @@ async function statusCommand() {
   const running = Boolean(pidRunning || health?.ok);
   console.log(JSON.stringify({
     running,
-    profile: PROFILE_NAME || null,
+    subscription: SUB_NAME || null,
     pid: pidRunning ? pid : null,
     base_url: BASE_URL,
     wire_api: "responses",
-    backend: BACKEND,
+    type: BACKEND,
     default_model: DEFAULT_MODEL,
     cursor_model: BACKEND === "cursor-acp" || BACKEND === "cursor" ? CURSOR_MODEL : null,
     health: health?.body || null,
@@ -1660,7 +2050,180 @@ async function statusCommand() {
   }, null, 2));
 }
 
+function runProbe(command, args = [], options = {}) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: options.timeoutMs || 3000,
+    env: options.env || process.env,
+  });
+  return {
+    ok: result.status === 0,
+    status: result.status ?? null,
+    stdout: String(result.stdout || "").trim(),
+    stderr: String(result.stderr || "").trim(),
+    error: result.error ? result.error.message : null,
+  };
+}
+
+function commandProbe(command, args = ["--version"]) {
+  const result = runProbe(command, args);
+  return {
+    available: !result.error,
+    ok: result.ok,
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    error: result.error,
+  };
+}
+
+function codexAuthDoctor() {
+  const details = {
+    path: AUTH_PATH,
+    exists: existsSync(AUTH_PATH),
+    accessTokenPresent: false,
+    refreshTokenPresent: false,
+    accountIdPresent: false,
+    expiresAt: null,
+    expiresInSeconds: null,
+    error: null,
+  };
+  if (!details.exists) return details;
+  try {
+    const auth = readJson(AUTH_PATH);
+    const accessToken = auth?.tokens?.access_token;
+    const refreshToken = auth?.tokens?.refresh_token;
+    details.accessTokenPresent = typeof accessToken === "string" && accessToken.length > 0;
+    details.refreshTokenPresent = typeof refreshToken === "string" && refreshToken.length > 0;
+    try {
+      details.accountIdPresent = Boolean(details.accessTokenPresent && extractAccountId(accessToken, auth));
+    } catch {}
+    const payload = decodeJwtPayload(accessToken);
+    if (typeof payload?.exp === "number") {
+      details.expiresAt = new Date(payload.exp * 1000).toISOString();
+      details.expiresInSeconds = Math.floor(payload.exp - Date.now() / 1000);
+    }
+  } catch (error) {
+    details.error = error instanceof Error ? error.message : String(error);
+  }
+  return details;
+}
+
+function cursorAuthDoctor() {
+  return {
+    dir: CURSOR_LOCAL_AUTH_DIR,
+    tokenPath: CURSOR_LOCAL_AUTH_TOKEN_PATH,
+    tokenExists: existsSync(CURSOR_LOCAL_AUTH_TOKEN_PATH),
+    envTokenPresent: Boolean(envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]))),
+  };
+}
+
+function launchdDoctor() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const manager = commandProbe("launchctl", ["managername"]);
+  const gui = uid === null ? null : runProbe("launchctl", ["print", `gui/${uid}`], { timeoutMs: 3000 });
+  const subscriptionLabel = SUB_NAME ? `com.sub-bridge.${slug(SUB_NAME)}` : null;
+  const subscription = subscriptionLabel && uid !== null ? runProbe("launchctl", ["print", `gui/${uid}/${subscriptionLabel}`]) : null;
+  return {
+    uid,
+    manager: manager.stdout || null,
+    available: manager.available,
+    guiSessionAvailable: Boolean(gui?.ok),
+    subscriptionLabel,
+    subscriptionLoaded: subscription ? subscription.ok : null,
+    message: subscription && !subscription.ok ? subscription.stderr || subscription.error : null,
+  };
+}
+
+function copilotDoctor() {
+  const details = {
+    dbPath: COPILOT_DB,
+    exists: existsSync(COPILOT_DB),
+    sqlite3: commandProbe("sqlite3", ["--version"]),
+    providerId: PROVIDER_ID,
+    provider: null,
+    modelCount: null,
+    error: null,
+  };
+  if (!details.sqlite3.available || !details.exists) return details;
+
+  const providerSql = `select id, name, base_url, wire_api from model_providers where id=${sqlQuote(PROVIDER_ID)};`;
+  const providerResult = runProbe("sqlite3", ["-separator", "\t", COPILOT_DB, providerSql]);
+  if (!providerResult.ok) {
+    details.error = providerResult.stderr || providerResult.error;
+    return details;
+  }
+  const [id, name, baseUrl, wireApi] = providerResult.stdout.split("\t");
+  if (id) {
+    details.provider = { id, name, baseUrl, wireApi };
+  }
+
+  const countSql = `select count(*) from provider_models where provider_id=${sqlQuote(PROVIDER_ID)};`;
+  const countResult = runProbe("sqlite3", [COPILOT_DB, countSql]);
+  if (countResult.ok && countResult.stdout) {
+    details.modelCount = Number(countResult.stdout);
+  }
+  return details;
+}
+
+async function doctorCommand() {
+  const pid = readPid();
+  const pidRunning = pid ? isPidRunning(pid) : false;
+  let health = null;
+  try {
+    health = await fetchJson(HEALTH_URL);
+  } catch (error) {
+    health = { ok: false, status: null, body: null, error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const isCursorBackend = BACKEND === "cursor-acp" || BACKEND === "cursor";
+  console.log(JSON.stringify({
+    subscription: SUB_NAME || null,
+    configPath: CONFIG_PATH,
+    effective: effectiveConfig(),
+    runtime: {
+      pid: pidRunning ? pid : null,
+      pidPath: PID_PATH,
+      logPath: LOG_PATH,
+      healthUrl: HEALTH_URL,
+      healthStatus: health?.status ?? null,
+      health: health?.body || null,
+      healthError: health?.error || null,
+    },
+    tools: {
+      node: { version: process.version },
+      codex: commandProbe("codex", ["--version"]),
+      cursorAgent: commandProbe(CURSOR_ACP_COMMAND, ["about", "--format", "json"]),
+      sqlite3: commandProbe("sqlite3", ["--version"]),
+    },
+    auth: {
+      cursor: isCursorBackend
+        ? {
+            local: cursorAuthDoctor(),
+            agent: cursorAbout({
+              command: CURSOR_ACP_COMMAND,
+              env: makeCursorRuntimeEnv(),
+              timeoutMs: 8000,
+            }),
+          }
+        : null,
+      codex: codexAuthDoctor(),
+    },
+    macos: {
+      launchd: launchdDoctor(),
+    },
+    copilot: copilotDoctor(),
+  }, null, 2));
+}
+
 async function startCommand() {
+  if (!SUB_NAME) {
+    for (const subscription of requireSubscriptions()) {
+      runSubscriptionCommand(subscription, "start");
+    }
+    return;
+  }
+
   ensureStateDir();
   const pid = readPid();
   if (pid && isPidRunning(pid)) {
@@ -1670,7 +2233,7 @@ async function startCommand() {
 
   removePidFile();
   const out = openSync(LOG_PATH, "a", 0o600);
-  const childArgs = PROFILE_NAME ? [process.argv[1], "--profile", PROFILE_NAME, "serve"] : [process.argv[1], "serve"];
+  const childArgs = SUB_NAME ? [process.argv[1], "--sub", SUB_NAME, "serve"] : [process.argv[1], "serve"];
   const child = spawn(process.execPath, childArgs, {
     detached: true,
     stdio: ["ignore", out, out],
@@ -1680,11 +2243,30 @@ async function startCommand() {
   writeFileSync(PID_PATH, `${child.pid}\n`, { mode: 0o600 });
   console.log(`started pid=${child.pid}`);
   console.log(`base_url=${BASE_URL}`);
-  console.log(`backend=${BACKEND}`);
+  console.log(`type=${BACKEND}`);
   console.log(`log=${LOG_PATH}`);
 }
 
+async function enableCommand() {
+  if (!SUB_NAME) {
+    for (const subscription of requireSubscriptions()) {
+      runSubscriptionCommand(subscription, "enable");
+    }
+    return;
+  }
+
+  await startCommand();
+  console.log(`enabled subscription=${SUB_NAME || "default"}`);
+}
+
 function stopCommand() {
+  if (!SUB_NAME) {
+    for (const subscription of requireSubscriptions()) {
+      runSubscriptionCommand(subscription, "stop");
+    }
+    return;
+  }
+
   const pid = readPid();
   if (!pid) {
     console.log("stopped");
@@ -1712,25 +2294,27 @@ function stopCommand() {
 }
 
 function loginCommand() {
-  const result =
-    BACKEND === "cursor-acp" || BACKEND === "cursor"
-      ? spawnSync(CURSOR_ACP_COMMAND, ["login"], {
-          stdio: "inherit",
-          env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
-        })
-      : spawnSync("codex", ["login"], { stdio: "inherit" });
+  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
+    const token = envValue(...envKeysForSub("CURSOR_AUTH_TOKEN", ["SUB_BRIDGE_CURSOR_AUTH_TOKEN", "CURSOR_AUTH_TOKEN"]));
+    if (!token || !String(token).trim()) {
+      throw new Error("Set SUB_BRIDGE_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN, then run cursor login again.");
+    }
+    saveCursorAuthToken(token);
+    console.log(`stored cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+    return;
+  }
+  const result = spawnSync("codex", ["login"], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
 }
 
 function logoutCommand() {
   stopCommand();
-  const result =
-    BACKEND === "cursor-acp" || BACKEND === "cursor"
-      ? spawnSync(CURSOR_ACP_COMMAND, ["logout"], {
-          stdio: "inherit",
-          env: makeCursorEnv({ forceCi: CURSOR_FORCE_CI }),
-        })
-      : spawnSync("codex", ["logout"], { stdio: "inherit" });
+  if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
+    removeCursorAuthToken();
+    console.log(`removed cursor auth token: ${CURSOR_LOCAL_AUTH_TOKEN_PATH}`);
+    return;
+  }
+  const result = spawnSync("codex", ["logout"], { stdio: "inherit" });
   process.exitCode = result.status ?? 1;
 }
 
@@ -1738,32 +2322,161 @@ function modelsCommand() {
   console.log(JSON.stringify(modelsResponse(), null, 2));
 }
 
+function modelsFromJson(value) {
+  const source = Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : Array.isArray(value?.models) ? value.models : [];
+  return normalizeModelList(
+    source.map((model) => {
+      if (typeof model === "string") return { id: model, displayName: `SubBridge ${model}` };
+      const id = model?.id || model?.modelId || model?.name;
+      return {
+        ...model,
+        id,
+        displayName: model?.displayName || model?.name || id,
+        contextWindow: model?.contextWindow || model?.max_prompt_tokens || model?.maxPromptTokens,
+        maxTokens: model?.maxTokens || model?.max_output_tokens || model?.maxOutputTokens,
+      };
+    }),
+  );
+}
+
+function modelsFromText(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^no models available/i.test(line))
+    .filter((line) => !/^usage:/i.test(line));
+  return normalizeModelList(lines.map((line) => {
+    const clean = line.replace(/^[*-]\s*/, "");
+    const id = clean.split(/\s{2,}|\t/)[0].trim();
+    return { id, displayName: clean };
+  }));
+}
+
+function parseModelCommandOutput(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return [];
+  try {
+    return modelsFromJson(JSON.parse(trimmed));
+  } catch {
+    return modelsFromText(trimmed);
+  }
+}
+
+function mergeFetchedModels(fetchedModels, configuredModels) {
+  const configuredById = new Map(normalizeModelList(configuredModels).map((model) => [model.id, model]));
+  const optionKeys = [
+    "reasoningEffort",
+    "fastMode",
+    "thinking",
+    "cursorContextWindow",
+    "cursorContext",
+    "contextOption",
+    "cursorModel",
+  ];
+  return normalizeModelList(fetchedModels).map((model) => {
+    const configured =
+      configuredById.get(model.id) ||
+      configuredById.get(stripCursorParameterizedSuffix(model.id));
+    if (!configured) return model;
+    const merged = { ...model };
+    for (const key of optionKeys) {
+      if (configured[key] !== undefined) merged[key] = configured[key];
+    }
+    return merged;
+  });
+}
+
+async function fetchCursorModelSnapshot() {
+  const fetchViaAcp = async (env, source) => {
+    const models = normalizeModelList(await fetchCursorAcpModels({
+      command: CURSOR_ACP_COMMAND,
+      apiEndpoint: CURSOR_API_ENDPOINT || undefined,
+      workspace: CURSOR_WORKSPACE,
+      env,
+      timeoutMs: CURSOR_ACP_TIMEOUT_MS,
+      onStderr: () => {},
+      onProtocolError: () => {},
+    }));
+    return models.length > 0 ? { models, source } : null;
+  };
+
+  try {
+    const snapshot = await fetchViaAcp(makeBridgeCursorEnv(), "cursor-acp-local-auth");
+    if (snapshot) return snapshot;
+  } catch {}
+
+  try {
+    const snapshot = await fetchViaAcp(makeCursorEnv({ forceCi: CURSOR_FORCE_CI }), "cursor-acp-agent-auth");
+    if (snapshot) return snapshot;
+  } catch (error) {
+    const fallback = fetchCursorModelCommandSnapshot();
+    if (fallback.source !== "builtin") return fallback;
+    return {
+      ...fallback,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  return fetchCursorModelCommandSnapshot();
+}
+
+function fetchCursorModelCommandSnapshot() {
+  const result = spawnSync(CURSOR_ACP_COMMAND, ["models"], {
+    encoding: "utf8",
+    timeout: 8000,
+    env: makeCursorRuntimeEnv(),
+  });
+  const models = normalizeModelList(parseCursorCliModelList(result.stdout));
+  if (result.status === 0 && models.length > 0) {
+    return { models, source: "cursor-agent" };
+  }
+  return {
+    models: BUILTIN_MODELS,
+    source: "builtin",
+    error: result.stderr || result.stdout || result.error?.message || null,
+  };
+}
+
+async function fetchCodexModelSnapshot() {
+  try {
+    const runtime = await loadPiRuntime();
+    const models = normalizeModelList(Array.from(runtime.models.values()).map((model) => ({
+      id: model.id,
+      displayName: model.displayName || model.name || `SubBridge ${model.id}`,
+      contextWindow: model.contextWindow || model.context_window,
+      maxTokens: model.maxTokens || model.max_tokens,
+    })));
+    if (models.length > 0) return { models, source: "pi-runtime" };
+  } catch (error) {
+    return {
+      models: BUILTIN_MODELS,
+      source: "builtin",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return { models: BUILTIN_MODELS, source: "builtin" };
+}
+
+async function fetchModelSnapshot() {
+  const snapshot =
+    BACKEND === "cursor-acp" || BACKEND === "cursor"
+      ? await fetchCursorModelSnapshot()
+      : await fetchCodexModelSnapshot();
+  return {
+    models: mergeFetchedModels(snapshot.models, CONFIG.models),
+  };
+}
+
 const CONFIG_SCHEMA = new Map([
+  ["$schema", "string"],
+  ["version", "number"],
   ["host", "string"],
   ["port", "number"],
-  ["model", "string"],
-  ["backend", "string"],
-  ["authPath", "string"],
-  ["copilotDb", "string"],
-  ["bridgeKey", "string"],
-  ["originator", "string"],
+  ["models", "json"],
+  ["type", "string"],
   ["providerId", "string"],
   ["providerName", "string"],
-  ["stateDir", "string"],
-  ["pidPath", "string"],
-  ["logPath", "string"],
-  ["reasoningEffort", "string"],
-  ["usePi", "boolean"],
-  ["piDir", "string"],
-  ["piTransport", "string"],
-  ["timeoutMs", "number"],
-  ["stripTools", "boolean"],
-  ["cursorAcpCommand", "string"],
-  ["cursorApiEndpoint", "string"],
-  ["cursorWorkspace", "string"],
-  ["cursorModel", "string"],
-  ["cursorAcpTimeoutMs", "number"],
-  ["cursorForceCi", "boolean"],
 ]);
 
 function parseConfigInput(key, value) {
@@ -1780,71 +2493,43 @@ function parseConfigInput(key, value) {
     if (["0", "false", "no", "off"].includes(normalized)) return false;
     throw new Error(`Config key ${key} requires a boolean`);
   }
+  if (type === "json") {
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      throw new Error(`Config key ${key} requires JSON`);
+    }
+  }
   return String(value);
 }
 
 function configTemplate() {
   return {
+    type: BACKEND,
     host: HOST,
     port: PORT,
-    model: DEFAULT_MODEL,
-    backend: BACKEND,
-    reasoningEffort: REASONING_EFFORT,
-    usePi: USE_PI_WRAPPER,
-    piDir: PI_RUNTIME_DIR,
-    piTransport: PI_TRANSPORT,
-    timeoutMs: PI_TIMEOUT_MS,
-    stripTools: STRIP_COPILOT_TOOLS,
-    cursorAcpCommand: CURSOR_ACP_COMMAND,
-    cursorApiEndpoint: CURSOR_API_ENDPOINT,
-    cursorWorkspace: CURSOR_WORKSPACE,
-    cursorModel: CURSOR_MODEL,
-    cursorAcpTimeoutMs: CURSOR_ACP_TIMEOUT_MS,
-    cursorForceCi: CURSOR_FORCE_CI,
-    authPath: AUTH_PATH,
-    copilotDb: COPILOT_DB,
+    providerId: PROVIDER_ID,
+    providerName: PROVIDER_NAME,
+    models: MODELS,
   };
 }
 
 function redactedConfig(value) {
   const copy = JSON.parse(JSON.stringify(value || {}));
-  if (copy.bridgeKey) copy.bridgeKey = "<redacted>";
-  if (copy.profiles && typeof copy.profiles === "object") {
-    for (const profile of Object.values(copy.profiles)) {
-      if (profile?.bridgeKey) profile.bridgeKey = "<redacted>";
-    }
-  }
   return copy;
 }
 
 function effectiveConfig() {
   return {
-    profile: PROFILE_NAME || null,
+    subscription: SUB_NAME || null,
+    type: BACKEND,
     host: HOST,
     port: PORT,
-    model: DEFAULT_MODEL,
-    backend: BACKEND,
-    authPath: AUTH_PATH,
-    copilotDb: COPILOT_DB,
-    bridgeKeyPresent: Boolean(BRIDGE_KEY),
-    originator: ORIGINATOR,
     providerId: PROVIDER_ID,
     providerName: PROVIDER_NAME,
-    stateDir: STATE_DIR,
-    pidPath: PID_PATH,
-    logPath: LOG_PATH,
-    reasoningEffort: REASONING_EFFORT,
-    usePi: USE_PI_WRAPPER,
-    piDir: PI_RUNTIME_DIR,
-    piTransport: PI_TRANSPORT,
-    timeoutMs: PI_TIMEOUT_MS,
-    stripTools: STRIP_COPILOT_TOOLS,
-    cursorAcpCommand: CURSOR_ACP_COMMAND,
-    cursorApiEndpoint: CURSOR_API_ENDPOINT,
-    cursorWorkspace: CURSOR_WORKSPACE,
-    cursorModel: CURSOR_MODEL,
-    cursorAcpTimeoutMs: CURSOR_ACP_TIMEOUT_MS,
-    cursorForceCi: CURSOR_FORCE_CI,
+    defaultModel: DEFAULT_MODEL,
+    defaultReasoningEffort: REASONING_EFFORT,
+    models: MODELS,
     baseUrl: BASE_URL,
   };
 }
@@ -1857,70 +2542,77 @@ function writeConfigFile(config) {
 }
 
 function writeActiveConfigValue(key, value) {
-  if (!PROFILE_NAME) {
-    writeConfigFile({ ...CONFIG_FILE, [key]: value });
-    return;
+  const configKey = key;
+  if (!SUB_NAME) {
+    if (configKey === "$schema" || configKey === "version") {
+      writeConfigFile({ ...configDocument(), [configKey]: value });
+      return;
+    }
+    throw new Error(`Use --sub <name> for config set ${configKey}`);
   }
-  const profiles =
-    CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
-      ? { ...CONFIG_FILE.profiles }
-      : {};
-  const profileConfig =
-    profiles[PROFILE_NAME] && typeof profiles[PROFILE_NAME] === "object" && !Array.isArray(profiles[PROFILE_NAME])
-      ? profiles[PROFILE_NAME]
-      : {};
-  profiles[PROFILE_NAME] = { ...profileConfig, [key]: value };
-  writeConfigFile({ ...CONFIG_FILE, profiles });
+  const subscriptions = subscriptionsFromConfig(CONFIG_FILE);
+  const subscriptionConfig =
+    subscriptions[SUB_NAME] && typeof subscriptions[SUB_NAME] === "object" && !Array.isArray(subscriptions[SUB_NAME])
+      ? subscriptions[SUB_NAME]
+      : configTemplate();
+  subscriptions[SUB_NAME] = normalizeSubscriptionConfig({ ...configTemplate(), ...subscriptionConfig, [configKey]: value });
+  writeConfigFile(configDocument(subscriptions));
 }
 
 function unsetActiveConfigValue(key) {
-  if (!PROFILE_NAME) {
-    const nextConfig = { ...CONFIG_FILE };
-    delete nextConfig[key];
-    writeConfigFile(nextConfig);
-    return;
+  const configKey = key;
+  if (!SUB_NAME) {
+    if (configKey === "$schema" || configKey === "version") {
+      const nextConfig = configDocument();
+      delete nextConfig[configKey];
+      writeConfigFile(nextConfig);
+      return;
+    }
+    throw new Error(`Use --sub <name> for config unset ${configKey}`);
   }
-  const profiles =
-    CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
-      ? { ...CONFIG_FILE.profiles }
+  const subscriptions = subscriptionsFromConfig(CONFIG_FILE);
+  const subscriptionConfig =
+    subscriptions[SUB_NAME] && typeof subscriptions[SUB_NAME] === "object" && !Array.isArray(subscriptions[SUB_NAME])
+      ? { ...subscriptions[SUB_NAME] }
       : {};
-  const profileConfig =
-    profiles[PROFILE_NAME] && typeof profiles[PROFILE_NAME] === "object" && !Array.isArray(profiles[PROFILE_NAME])
-      ? { ...profiles[PROFILE_NAME] }
-      : {};
-  delete profileConfig[key];
-  profiles[PROFILE_NAME] = profileConfig;
-  writeConfigFile({ ...CONFIG_FILE, profiles });
+  delete subscriptionConfig[configKey];
+  subscriptions[SUB_NAME] = normalizeSubscriptionConfig(subscriptionConfig);
+  writeConfigFile(configDocument(subscriptions));
 }
 
-function configCommand(args) {
+function writeSubscriptionConfig(subscriptionName, subscriptionConfig) {
+  const subscriptions = subscriptionsFromConfig(CONFIG_FILE);
+  subscriptions[subscriptionName] = normalizeSubscriptionConfig(subscriptionConfig);
+  writeConfigFile(configDocument(subscriptions));
+}
+
+async function configCommand(args) {
   const action = args[0] || "show";
   if (action === "path") {
     console.log(CONFIG_PATH);
     return;
   }
   if (action === "show") {
+    const normalizedFile = configDocument();
     console.log(JSON.stringify({
       configPath: CONFIG_PATH,
-      profile: PROFILE_NAME || null,
+      subscription: SUB_NAME || null,
       exists: existsSync(CONFIG_PATH),
-      file: redactedConfig(CONFIG_FILE),
+      file: redactedConfig(normalizedFile),
       active: redactedConfig(CONFIG),
-      effective: effectiveConfig(),
+      effective: SUB_NAME ? effectiveConfig() : null,
     }, null, 2));
     return;
   }
   if (action === "init") {
-    const nextConfig = { ...configTemplate(), ...CONFIG };
-    if (PROFILE_NAME) {
-      const profiles =
-        CONFIG_FILE.profiles && typeof CONFIG_FILE.profiles === "object" && !Array.isArray(CONFIG_FILE.profiles)
-          ? { ...CONFIG_FILE.profiles }
-          : {};
-      profiles[PROFILE_NAME] = nextConfig;
-      writeConfigFile({ ...CONFIG_FILE, profiles });
-    } else {
-      writeConfigFile(nextConfig);
+    if (!SUB_NAME) {
+      writeConfigFile(configDocument());
+      console.log(`wrote ${CONFIG_PATH}`);
+      return;
+    }
+    const nextConfig = { ...configTemplate(), ...CONFIG, ...(await fetchModelSnapshot()) };
+    if (SUB_NAME) {
+      writeSubscriptionConfig(SUB_NAME, nextConfig);
     }
     console.log(`wrote ${CONFIG_PATH}`);
     return;
@@ -1928,6 +2620,13 @@ function configCommand(args) {
   if (action === "get") {
     const key = args[1];
     if (!CONFIG_SCHEMA.has(key)) throw new Error(`Unknown config key: ${key}`);
+    if (!SUB_NAME && key !== "$schema" && key !== "version") {
+      throw new Error(`Use --sub <name> for config get ${key}`);
+    }
+    if (key === "$schema" || key === "version") {
+      console.log(JSON.stringify(configDocument()[key], null, 2));
+      return;
+    }
     const value = effectiveConfig()[key] ?? CONFIG[key] ?? null;
     console.log(JSON.stringify(value, null, 2));
     return;
@@ -2082,7 +2781,23 @@ function targetsCommand() {
   console.log(JSON.stringify(TARGETS.map(({ id, name, status }) => ({ id, name, status })), null, 2));
 }
 
+function installTargetForSubscription(subscriptionName, targetId) {
+  const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, "install", targetId], {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if ((result.status ?? 1) !== 0) process.exitCode = result.status ?? 1;
+}
+
 function installTarget(targetId = "copilot") {
+  if (targetId === "copilot" && !SUB_NAME) {
+    const subscriptions = allSubscriptionNames();
+    if (subscriptions.length === 0) throw new Error(`No subscriptions configured in ${CONFIG_PATH}`);
+    console.log(`installing subscriptions: ${subscriptions.join(", ")}`);
+    for (const subscription of subscriptions) installTargetForSubscription(subscription, targetId);
+    return;
+  }
+
   const target = TARGETS.find((item) => item.id === targetId);
   if (!target) {
     console.error(`Unknown target: ${targetId}`);
@@ -2095,15 +2810,20 @@ function installTarget(targetId = "copilot") {
 
 const args = GLOBAL_ARGS.args;
 const command = args[0] || "status";
-if (command === "serve") startServer();
+if (command === "serve") {
+  if (!SUB_NAME) throw new Error("Use --sub <name> serve");
+  startServer();
+}
 else if (command === "start") await startCommand();
 else if (command === "stop") stopCommand();
 else if (command === "status") await statusCommand();
+else if (command === "enable") await enableCommand();
 else if (command === "login") loginCommand();
 else if (command === "logout") logoutCommand();
+else if (command === "doctor") await doctorCommand();
 else if (command === "check" || command === "probe") await checkCommand();
 else if (command === "models") modelsCommand();
-else if (command === "config") configCommand(args.slice(1));
+else if (command === "config") await configCommand(args.slice(1));
 else if (command === "targets") targetsCommand();
 else if (command === "install") installTarget(args[1]);
 else if (command === "install-copilot") installTarget("copilot");

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/alexzhang1030/sub-bridge/main/schemas/config.schema.json",
+  "title": "sub-bridge config",
+  "type": "object",
+  "required": ["$schema", "version", "subscriptions"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "subscriptions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/subscription"
+      }
+    }
+  },
+  "$defs": {
+    "model": {
+      "type": "object",
+      "required": ["id", "displayName", "contextWindow", "maxTokens"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "displayName": { "type": "string", "minLength": 1 },
+        "contextWindow": { "type": "integer", "minimum": 1 },
+        "maxTokens": { "type": "integer", "minimum": 1 },
+        "reasoningEffort": { "type": "string", "minLength": 1 },
+        "defaultReasoningEffort": { "type": "string", "minLength": 1 },
+        "fastMode": { "type": "boolean" },
+        "thinking": { "type": "boolean" },
+        "cursorContextWindow": { "type": "string", "minLength": 1 },
+        "cursorContext": { "type": "string", "minLength": 1 },
+        "contextOption": { "type": "string", "minLength": 1 },
+        "defaultContextWindow": { "type": "string", "minLength": 1 },
+        "cursorModel": { "type": "string", "minLength": 1 },
+        "supportsFastMode": { "type": "boolean" },
+        "supportsThinking": { "type": "boolean" },
+        "upstreamProviderId": { "type": "string", "minLength": 1 },
+        "upstreamProviderName": { "type": "string", "minLength": 1 },
+        "supportedReasoningEfforts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["value", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "value": { "type": "string", "minLength": 1 },
+              "label": { "type": "string", "minLength": 1 },
+              "isDefault": { "type": "boolean" }
+            }
+          }
+        },
+        "contextWindowOptions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["value", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "value": { "type": "string", "minLength": 1 },
+              "label": { "type": "string", "minLength": 1 },
+              "isDefault": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "subscription": {
+      "type": "object",
+      "required": ["type", "host", "port", "providerId", "providerName", "models"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["codex", "cursor", "cursor-acp"] },
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "providerId": { "type": "string", "minLength": 1 },
+        "providerName": { "type": "string", "minLength": 1 },
+        "models": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/model" }
+        }
+      }
+    }
+  }
+}
