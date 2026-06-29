@@ -629,7 +629,39 @@ export function mergeCursorModelVariantsWithBaseControls(models) {
     seen.add(key);
     merged.push(model);
   }
-  return merged;
+  return dedupeCursorModelsByVisibleName(merged);
+}
+
+function cursorVisibleModelKey(model) {
+  const familyId = normalizeCursorModelVariantBaseId(model?.id) || String(model?.id || "").trim();
+  const displayName = String(model?.displayName || humanizeCursorModelName(model?.id)).trim();
+  return `${familyId}|${normalizedText(displayName)}`;
+}
+
+function cursorVisibleModelPriority(model) {
+  const id = String(model?.id || "").trim();
+  if (id.includes("[")) return 0;
+  if (normalizeCursorModelVariantBaseId(id) === id) return 1;
+  return 2;
+}
+
+function dedupeCursorModelsByVisibleName(models) {
+  const entries = [];
+  const byKey = new Map();
+  for (const model of models) {
+    const key = cursorVisibleModelKey(model);
+    const existingIndex = byKey.get(key);
+    if (existingIndex === undefined) {
+      byKey.set(key, entries.length);
+      entries.push(model);
+      continue;
+    }
+    const existing = entries[existingIndex];
+    if (cursorVisibleModelPriority(model) < cursorVisibleModelPriority(existing)) {
+      entries[existingIndex] = model;
+    }
+  }
+  return entries;
 }
 
 export function cursorModelGroupEntries(model) {

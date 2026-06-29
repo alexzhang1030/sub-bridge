@@ -640,6 +640,25 @@ test("cursor model variants follow Synara base plus raw variant shape", () => {
   assert.equal(normalizeCursorModelVariantBaseId("claude-opus-4-8-thinking-max"), "claude-opus-4-8");
   assert.equal(normalizeCursorModelVariantBaseId("gpt-5.1-codex-max-medium-fast"), "gpt-5.1-codex-max");
 
+  const composerModels = mergeCursorModelVariantsWithBaseControls([
+    {
+      id: "composer-2.5",
+      displayName: "Composer 2.5",
+      contextWindow: 128000,
+      maxTokens: 128000,
+      supportsFastMode: true,
+    },
+    {
+      id: "composer-2.5-fast",
+      displayName: "Composer 2.5 Fast",
+      contextWindow: 128000,
+      maxTokens: 128000,
+      fastMode: true,
+    },
+  ]);
+  assert.deepEqual(composerModels.map((model) => model.id), ["composer-2.5", "composer-2.5[fast=true]"]);
+  assert.deepEqual(composerModels.map((model) => model.displayName), ["Composer 2.5", "Composer 2.5 Fast"]);
+
   const models = mergeCursorModelVariantsWithBaseControls([
     {
       id: "claude-opus-4-8",
