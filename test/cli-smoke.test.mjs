@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { responsesBodyToCursorPrompt, runCursorAcpTurn } from "../src/cursor-acp.js";
+import { cursorOptionsFromModelEntry } from "../src/cursor-models.js";
 
 const root = new URL("..", import.meta.url).pathname;
 const cli = join(root, "src", "cli.js");
@@ -174,6 +175,38 @@ rl.on("line", (line) => {
     return;
   }
   if (request.method === "session/prompt") {
+    if (process.env.MOCK_CURSOR_EVENTS === "1") {
+      const notify = (update) => process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "mock-session", update }
+      }) + "\\n");
+      notify({
+        sessionUpdate: "agent_thought_chunk",
+        messageId: "thought-1",
+        content: { type: "text", text: "checking workspace" }
+      });
+      notify({
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-1",
+        title: "Terminal",
+        kind: "execute",
+        status: "pending",
+        rawInput: { executable: "echo", args: ["pong"] }
+      });
+      notify({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-1",
+        kind: "execute",
+        status: "completed",
+        rawOutput: { exitCode: 0 }
+      });
+      notify({
+        sessionUpdate: "agent_message_chunk",
+        messageId: "answer-1",
+        content: { type: "text", text: "pong" }
+      });
+    }
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0",
       id: request.id,
@@ -186,6 +219,30 @@ rl.on("line", (line) => {
 `, { mode: 0o755 });
   chmodSync(command, 0o755);
   return { command, dir };
+}
+
+async function waitForUrl(url, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${url}`);
+}
+
+function parseSseTypes(text) {
+  const types = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (!payload || payload === "[DONE]") continue;
+    const event = JSON.parse(payload);
+    if (event?.type) types.push(event.type);
+  }
+  return types;
 }
 
 test("prints help with project command names", () => {
@@ -381,6 +438,98 @@ test("cursor ACP sets requested model and per-model options", async () => {
     assert.ok(writes.some((entry) => entry.configId === "fast" && entry.value === false));
     assert.ok(writes.some((entry) => entry.configId === "thinking" && entry.value === true));
   } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor model options preserve legacy off as fast mode off", () => {
+  assert.deepEqual(cursorOptionsFromModelEntry({
+    id: "claude-haiku-4-5",
+    displayName: "Haiku 4.5",
+    contextWindow: 128000,
+    maxTokens: 128000,
+    reasoningEffort: "off",
+  }), {
+    fastMode: false,
+  });
+});
+
+test("cursor ACP surfaces reasoning, tool calls, and assistant events", async () => {
+  const mock = createMockCursorAgent();
+  try {
+    const result = await runCursorAcpTurn({
+      command: mock.command,
+      workspace: root,
+      env: {
+        ...process.env,
+        MOCK_CURSOR_EVENTS: "1",
+      },
+      timeoutMs: 5000,
+      model: "gpt-5.5",
+      body: {
+        input: "Say pong.",
+      },
+    });
+
+    assert.equal(result.text, "pong");
+    assert.deepEqual(result.events.map((event) => event.type), [
+      "content_delta",
+      "tool_call",
+      "tool_call",
+      "content_delta",
+    ]);
+    assert.equal(result.events[0].streamKind, "reasoning_text");
+    assert.equal(result.events[1].toolCall.kind, "execute");
+    assert.equal(result.events[2].toolCall.status, "completed");
+    assert.equal(result.events[3].streamKind, "assistant_text");
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor bridge streams reasoning and tool call Responses events", async () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  const port = String(25000 + (process.pid % 10000));
+  let child = null;
+  try {
+    assert.match(run(["--sub", "cursor-sse", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor-sse", "config", "set", "port", port]), /set port/);
+    assert.match(run(["--sub", "cursor-sse", "config", "set", "models", JSON.stringify([
+      { id: "gpt-5.5", displayName: "GPT-5.5", contextWindow: 128000, maxTokens: 128000 },
+    ])]), /set models/);
+
+    child = spawn(process.execPath, [cli, "--sub", "cursor-sse", "serve"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUB_BRIDGE_CONFIG: testConfig,
+        SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+        MOCK_CURSOR_EVENTS: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitForUrl(`http://127.0.0.1:${port}/v1/models`);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        input: "Say pong.",
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    const types = parseSseTypes(text);
+    assert.ok(types.includes("response.reasoning_summary_text.delta"));
+    assert.ok(types.includes("response.function_call_arguments.delta"));
+    assert.ok(types.includes("response.function_call_arguments.done"));
+    assert.ok(types.includes("response.output_text.delta"));
+    assert.ok(types.includes("response.completed"));
+  } finally {
+    if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });
   }
 });

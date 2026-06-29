@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   collectCursorAcpConfigUpdates,
   cursorModelsFromAvailableModels,
@@ -9,6 +10,9 @@ import {
   modelConfigId,
   resolveCursorAcpModelValue,
 } from "./cursor-models.js";
+
+const packageInfo = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const clientInfo = { name: "sub-bridge", version: String(packageInfo.version || "0.0.0") };
 
 function isRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value);
@@ -101,12 +105,155 @@ export function responsesBodyToCursorPrompt(body) {
   return prompt;
 }
 
-function parseSessionTextDelta(message) {
-  if (message?.method !== "session/update") return "";
+function trimNonEmpty(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed || undefined;
+}
+
+function normalizeToolStatus(value, fallback = "in_progress") {
+  switch (value) {
+    case "pending":
+      return "pending";
+    case "in_progress":
+    case "inProgress":
+      return "in_progress";
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    default:
+      return fallback;
+  }
+}
+
+function normalizeCommandValue(value) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function commandFromRawInput(rawInput, title) {
+  if (isRecord(rawInput)) {
+    const directCommand = normalizeCommandValue(rawInput.command);
+    if (directCommand) return directCommand;
+    const executable = typeof rawInput.executable === "string" ? rawInput.executable.trim() : "";
+    const args = normalizeCommandValue(rawInput.args);
+    if (executable && args) return `${executable} ${args}`;
+    if (executable) return executable;
+  }
+  const match = typeof title === "string" ? /`([^`]+)`/u.exec(title) : null;
+  return match?.[1]?.trim() || "";
+}
+
+function inferToolKind(update) {
+  if (typeof update.kind === "string" && update.kind.trim()) return update.kind.trim();
+  const title = String(update.title || "").trim().toLowerCase();
+  if (title === "find") return "search";
+  if (title === "read" || title === "read file") return "read";
+  if (title === "terminal") return "execute";
+  return "tool";
+}
+
+function summarizeLocations(locations) {
+  if (!Array.isArray(locations)) return "";
+  const paths = locations
+    .map((location) => {
+      if (!location || typeof location.path !== "string" || !location.path.trim()) return "";
+      return location.line === undefined || location.line === null
+        ? location.path.trim()
+        : `${location.path.trim()}:${location.line}`;
+    })
+    .filter(Boolean);
+  if (paths.length === 0) return "";
+  return paths.length === 1 ? paths[0] : `${paths[0]} +${paths.length - 1} more`;
+}
+
+function summarizeRawOutput(rawOutput) {
+  if (!isRecord(rawOutput)) return "";
+  if (Number.isFinite(Number(rawOutput.totalFiles))) return `${Number(rawOutput.totalFiles)} files found`;
+  if (typeof rawOutput.content === "string") {
+    const lines = rawOutput.content.split(/\r?\n/u).filter(Boolean).length;
+    return lines > 0 ? `Read ${lines} lines` : "";
+  }
+  if (Number.isFinite(Number(rawOutput.exitCode))) return `exit ${Number(rawOutput.exitCode)}`;
+  return "";
+}
+
+function actionTitleForKind(kind, status) {
+  const running = status === "pending" || status === "in_progress";
+  switch (kind) {
+    case "execute":
+      return "Ran command";
+    case "edit":
+      return running ? "Editing" : "Edited";
+    case "delete":
+      return running ? "Deleting" : "Deleted";
+    case "move":
+      return running ? "Moving" : "Moved";
+    case "search":
+      return running ? "Searching" : "Searched";
+    case "fetch":
+      return running ? "Fetching" : "Fetched";
+    case "read":
+      return running ? "Reading" : "Read";
+    default:
+      return String(kind || "tool");
+  }
+}
+
+function parseToolCallUpdate(update) {
+  const toolCallId = trimNonEmpty(update.toolCallId);
+  if (!toolCallId) return null;
+  const kind = inferToolKind(update);
+  const status = normalizeToolStatus(update.status, update.sessionUpdate === "tool_call" ? "pending" : "in_progress");
+  const command = commandFromRawInput(update.rawInput, update.title);
+  const locationDetail = summarizeLocations(update.locations);
+  const outputDetail = summarizeRawOutput(update.rawOutput);
+  const title = actionTitleForKind(kind, status);
+  const detail = command || locationDetail || outputDetail || trimNonEmpty(update.title) || "";
+  const data = {
+    toolCallId,
+    kind,
+    ...(command ? { command } : {}),
+    ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
+    ...(update.rawOutput !== undefined ? { rawOutput: update.rawOutput } : {}),
+    ...(update.content !== undefined ? { content: update.content } : {}),
+    ...(update.locations !== undefined ? { locations: update.locations } : {}),
+  };
+  return {
+    id: toolCallId,
+    kind,
+    status,
+    title,
+    ...(command ? { command } : {}),
+    ...(detail ? { detail } : {}),
+    data,
+  };
+}
+
+function parseSessionEvents(message) {
+  if (message?.method !== "session/update") return [];
   const update = message.params?.update;
-  if (update?.sessionUpdate !== "agent_message_chunk") return "";
-  const content = update.content;
-  return content?.type === "text" && typeof content.text === "string" ? content.text : "";
+  if (!update || typeof update.sessionUpdate !== "string") return [];
+  if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
+    const content = update.content;
+    if (content?.type !== "text" || typeof content.text !== "string" || !content.text) return [];
+    return [{
+      type: "content_delta",
+      streamKind: update.sessionUpdate === "agent_thought_chunk" ? "reasoning_text" : "assistant_text",
+      ...(trimNonEmpty(update.messageId) ? { itemId: trimNonEmpty(update.messageId) } : {}),
+      text: content.text,
+      raw: message,
+    }];
+  }
+  if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+    const toolCall = parseToolCallUpdate(update);
+    return toolCall ? [{ type: "tool_call", toolCall, raw: message }] : [];
+  }
+  return [];
 }
 
 function usageFromAcpUsage(usage) {
@@ -206,8 +353,12 @@ class CursorAcpClient {
       return;
     }
     if (message?.method) {
-      const delta = parseSessionTextDelta(message);
-      if (delta) this.options.onDelta?.(delta, message);
+      for (const event of parseSessionEvents(message)) {
+        this.options.onEvent?.(event, message);
+        if (event.type === "content_delta" && event.streamKind === "assistant_text") {
+          this.options.onDelta?.(event.text, message);
+        }
+      }
       this.options.onNotification?.(message);
     }
   }
@@ -321,8 +472,13 @@ async function configureCursorSession(client, sessionId, sessionSetup, options) 
 
 export async function runCursorAcpTurn(options) {
   const textChunks = [];
+  const events = [];
   const client = new CursorAcpClient({
     ...options,
+    onEvent: (event, raw) => {
+      events.push(event);
+      options.onEvent?.(event, raw);
+    },
     onDelta: (delta, raw) => {
       textChunks.push(delta);
       options.onDelta?.(delta, raw);
@@ -344,7 +500,7 @@ export async function runCursorAcpTurn(options) {
         terminal: false,
         _meta: { parameterizedModelPicker: true },
       },
-      clientInfo: { name: "sub-bridge", version: "0.1.0" },
+      clientInfo,
     });
     await client.request("authenticate", { methodId: "cursor_login" });
     const sessionSetup = await client.request("session/new", {
@@ -363,6 +519,7 @@ export async function runCursorAcpTurn(options) {
       text: outputText,
       promptResult,
       initializeResult,
+      events,
       usage: usageFromAcpUsage(promptResult?.usage),
       stopReason: promptResult?.stopReason || "completed",
     };
@@ -384,7 +541,7 @@ export async function fetchCursorAcpModels(options) {
         terminal: false,
         _meta: { parameterizedModelPicker: true },
       },
-      clientInfo: { name: "sub-bridge", version: "0.1.0" },
+      clientInfo,
     });
     await client.request("authenticate", { methodId: "cursor_login" });
     const sessionSetup = await client.request("session/new", {

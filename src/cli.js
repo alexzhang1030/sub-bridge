@@ -1626,6 +1626,97 @@ function resolveCursorAcpModel(requestModel) {
   return configured;
 }
 
+function safeToolIdentifier(value, fallback = "tool") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || fallback;
+}
+
+function cursorToolItemIds(toolCall) {
+  const suffix = safeToolIdentifier(toolCall?.id || randomUUID(), "tool");
+  return {
+    itemId: `fc_cursor_${suffix}`,
+    callId: `call_cursor_${suffix}`,
+  };
+}
+
+function cursorToolName(toolCall) {
+  return `cursor_${safeToolIdentifier(toolCall?.kind || "tool", "tool")}`;
+}
+
+function cursorToolArguments(toolCall) {
+  return JSON.stringify({
+    title: toolCall.title || cursorToolName(toolCall),
+    status: toolCall.status || "in_progress",
+    kind: toolCall.kind || "tool",
+    ...(toolCall.detail ? { detail: toolCall.detail } : {}),
+    ...(toolCall.command ? { command: toolCall.command } : {}),
+    ...(toolCall.data?.rawInput !== undefined ? { input: toolCall.data.rawInput } : {}),
+    ...(toolCall.data?.rawOutput !== undefined ? { output: toolCall.data.rawOutput } : {}),
+    ...(toolCall.data?.locations !== undefined ? { locations: toolCall.data.locations } : {}),
+  });
+}
+
+function cursorToolStatusIsTerminal(status) {
+  return status === "completed" || status === "failed";
+}
+
+function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
+  let reasoningText = "";
+  let assistantText = "";
+  const tools = new Map();
+
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
+      reasoningText += event.text;
+      continue;
+    }
+    if (event.type === "content_delta" && event.streamKind === "assistant_text") {
+      assistantText += event.text;
+      continue;
+    }
+    if (event.type === "tool_call") {
+      const ids = cursorToolItemIds(event.toolCall);
+      const existing = tools.get(event.toolCall.id);
+      const item = existing || {
+        id: ids.itemId,
+        type: "function_call",
+        call_id: ids.callId,
+        name: cursorToolName(event.toolCall),
+        arguments: "",
+        status: "in_progress",
+      };
+      item.name = cursorToolName(event.toolCall);
+      item.arguments = cursorToolArguments(event.toolCall);
+      if (cursorToolStatusIsTerminal(event.toolCall.status)) item.status = "completed";
+      tools.set(event.toolCall.id, item);
+    }
+  }
+
+  if (reasoningText) {
+    output.push({
+      id: `rs_${randomUUID().replace(/-/g, "")}`,
+      type: "reasoning",
+      status: "completed",
+      summary: [{ type: "summary_text", text: reasoningText }],
+    });
+  }
+  output.push(...tools.values());
+  const finalText = assistantText || fallbackText;
+  if (finalText) {
+    output.push({
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: finalText, annotations: [] }],
+    });
+  }
+}
+
 async function forwardResponsesCursorAcp(req, res, bodyText) {
   const startedAt = Date.now();
   const normalized = normalizeRequestBody(bodyText);
@@ -1675,14 +1766,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       if (!res.writableEnded) controller.abort();
     });
     const result = await runCursorAcpTurn({ ...runOptionsBase, signal: controller.signal });
-    const item = {
-      id: `msg_${randomUUID().replace(/-/g, "")}`,
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: result.text, annotations: [] }],
-    };
-    output.push(item);
+    appendCursorJsonOutputFromEvents(output, result.events, result.text);
     json(res, 200, responseObject({
       id: responseId,
       model: body.model,
@@ -1716,28 +1800,8 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     bytes += Math.max(0, res.writableLength - before);
   };
 
-  const outputIndex = 0;
-  const itemId = `msg_${randomUUID().replace(/-/g, "")}`;
-  const item = {
-    id: itemId,
-    type: "message",
-    status: "in_progress",
-    role: "assistant",
-    content: [],
-  };
-  const part = { type: "output_text", text: "", annotations: [] };
-  output.push(item);
-
   recordWrite("response.created", {
     response: responseObject({ id: responseId, model: body.model, output }),
-  });
-  recordWrite("response.output_item.added", { output_index: outputIndex, item });
-  item.content.push(part);
-  recordWrite("response.content_part.added", {
-    item_id: itemId,
-    output_index: outputIndex,
-    content_index: 0,
-    part,
   });
 
   const controller = new AbortController();
@@ -1745,35 +1809,197 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     if (!res.writableEnded) controller.abort();
   });
 
-  try {
-    const result = await runCursorAcpTurn({
-      ...runOptionsBase,
-      signal: controller.signal,
-      onDelta: (delta) => {
-        part.text += delta;
-        recordWrite("response.output_text.delta", {
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: 0,
-          delta,
-        });
-      },
-    });
-    item.status = "completed";
-    recordWrite("response.output_text.done", {
-      item_id: itemId,
-      output_index: outputIndex,
-      content_index: 0,
-      text: part.text || result.text,
-    });
-    if (!part.text && result.text) part.text = result.text;
-    recordWrite("response.content_part.done", {
-      item_id: itemId,
+  let nextOutputIndex = 0;
+  let assistantEntry = null;
+  let reasoningEntry = null;
+  const toolEntries = new Map();
+
+  const addOutputItem = (item) => {
+    const outputIndex = nextOutputIndex;
+    nextOutputIndex += 1;
+    output.push(item);
+    recordWrite("response.output_item.added", { output_index: outputIndex, item });
+    return outputIndex;
+  };
+
+  const ensureAssistantEntry = () => {
+    if (assistantEntry) return assistantEntry;
+    const item = {
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      status: "in_progress",
+      role: "assistant",
+      content: [],
+    };
+    const outputIndex = addOutputItem(item);
+    const part = { type: "output_text", text: "", annotations: [] };
+    item.content.push(part);
+    recordWrite("response.content_part.added", {
+      item_id: item.id,
       output_index: outputIndex,
       content_index: 0,
       part,
     });
-    recordWrite("response.output_item.done", { output_index: outputIndex, item });
+    assistantEntry = { item, part, outputIndex, text: "" };
+    return assistantEntry;
+  };
+
+  const finishAssistantEntry = () => {
+    if (!assistantEntry) return;
+    const entry = assistantEntry;
+    entry.item.status = "completed";
+    entry.part.text = entry.text;
+    recordWrite("response.output_text.done", {
+      item_id: entry.item.id,
+      output_index: entry.outputIndex,
+      content_index: 0,
+      text: entry.text,
+    });
+    recordWrite("response.content_part.done", {
+      item_id: entry.item.id,
+      output_index: entry.outputIndex,
+      content_index: 0,
+      part: entry.part,
+    });
+    recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    assistantEntry = null;
+  };
+
+  const ensureReasoningEntry = () => {
+    if (reasoningEntry) return reasoningEntry;
+    const item = {
+      id: `rs_${randomUUID().replace(/-/g, "")}`,
+      type: "reasoning",
+      status: "in_progress",
+      summary: [],
+    };
+    const outputIndex = addOutputItem(item);
+    const part = { type: "summary_text", text: "" };
+    item.summary.push(part);
+    recordWrite("response.reasoning_summary_part.added", {
+      item_id: item.id,
+      output_index: outputIndex,
+      summary_index: 0,
+      part,
+    });
+    reasoningEntry = { item, part, outputIndex, text: "" };
+    return reasoningEntry;
+  };
+
+  const finishReasoningEntry = () => {
+    if (!reasoningEntry) return;
+    const entry = reasoningEntry;
+    entry.item.status = "completed";
+    entry.part.text = entry.text;
+    recordWrite("response.reasoning_summary_text.done", {
+      item_id: entry.item.id,
+      output_index: entry.outputIndex,
+      summary_index: 0,
+      text: entry.text,
+    });
+    recordWrite("response.reasoning_summary_part.done", {
+      item_id: entry.item.id,
+      output_index: entry.outputIndex,
+      summary_index: 0,
+      part: entry.part,
+    });
+    recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    reasoningEntry = null;
+  };
+
+  const applyToolCallEvent = (toolCall) => {
+    finishAssistantEntry();
+    finishReasoningEntry();
+    const ids = cursorToolItemIds(toolCall);
+    const name = cursorToolName(toolCall);
+    const args = cursorToolArguments(toolCall);
+    let entry = toolEntries.get(toolCall.id);
+    if (!entry) {
+      const item = {
+        id: ids.itemId,
+        type: "function_call",
+        call_id: ids.callId,
+        name,
+        arguments: "",
+        status: "in_progress",
+      };
+      const outputIndex = addOutputItem(item);
+      entry = { item, outputIndex, argumentsWritten: false };
+      toolEntries.set(toolCall.id, entry);
+      recordWrite("response.function_call_arguments.delta", {
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: args,
+      });
+      entry.argumentsWritten = true;
+    }
+    entry.item.name = name;
+    entry.item.arguments = args;
+    if (cursorToolStatusIsTerminal(toolCall.status) && entry.item.status !== "completed") {
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        name,
+        arguments: args,
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    }
+  };
+
+  const finishOpenToolEntries = () => {
+    for (const entry of toolEntries.values()) {
+      if (entry.item.status === "completed") continue;
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        name: entry.item.name,
+        arguments: entry.item.arguments,
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    }
+  };
+
+  const applyCursorEvent = (event) => {
+    if (event.type === "content_delta" && event.streamKind === "assistant_text") {
+      const entry = ensureAssistantEntry();
+      entry.text += event.text;
+      entry.part.text = entry.text;
+      recordWrite("response.output_text.delta", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        content_index: 0,
+        delta: event.text,
+      });
+      return;
+    }
+    if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
+      const entry = ensureReasoningEntry();
+      entry.text += event.text;
+      entry.part.text = entry.text;
+      recordWrite("response.reasoning_summary_text.delta", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        summary_index: 0,
+        delta: event.text,
+      });
+      return;
+    }
+    if (event.type === "tool_call") {
+      applyToolCallEvent(event.toolCall);
+    }
+  };
+
+  try {
+    const result = await runCursorAcpTurn({
+      ...runOptionsBase,
+      signal: controller.signal,
+      onEvent: applyCursorEvent,
+    });
+    finishReasoningEntry();
+    finishAssistantEntry();
+    finishOpenToolEntries();
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
@@ -1796,7 +2022,9 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    item.status = "incomplete";
+    finishReasoningEntry();
+    finishAssistantEntry();
+    finishOpenToolEntries();
     recordWrite("response.failed", {
       response: responseObject({
         id: responseId,

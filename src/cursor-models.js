@@ -428,13 +428,28 @@ export function cursorOptionsFromModelEntry(model) {
   if (!model || typeof model !== "object") return {};
   const explicitContextWindow = model.cursorContextWindow || model.cursorContext || model.contextOption;
   const defaultContextWindow = model.defaultContextWindow;
-  const reasoningEffort = model.reasoningEffort || model.defaultReasoningEffort;
+  const rawReasoningEffort = model.reasoningEffort || model.defaultReasoningEffort;
+  const normalizedReasoningEffort = String(rawReasoningEffort || "").trim().toLowerCase();
+  const reasoningEffort =
+    normalizedReasoningEffort && !["off", "false", "0", "disabled", "fast", "true", "1"].includes(normalizedReasoningEffort)
+      ? String(rawReasoningEffort)
+      : "";
+  const fastModeFromReasoning =
+    ["off", "false", "0", "disabled"].includes(normalizedReasoningEffort)
+      ? false
+      : ["fast", "true", "1"].includes(normalizedReasoningEffort)
+        ? true
+        : undefined;
   return {
-    ...(reasoningEffort ? { reasoningEffort: String(reasoningEffort) } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(explicitContextWindow || defaultContextWindow
       ? { contextWindow: String(explicitContextWindow || defaultContextWindow) }
       : {}),
-    ...(typeof model.fastMode === "boolean" ? { fastMode: model.fastMode } : {}),
+    ...(typeof model.fastMode === "boolean"
+      ? { fastMode: model.fastMode }
+      : fastModeFromReasoning !== undefined
+        ? { fastMode: fastModeFromReasoning }
+        : {}),
     ...(typeof model.thinking === "boolean" ? { thinking: model.thinking } : {}),
   };
 }
