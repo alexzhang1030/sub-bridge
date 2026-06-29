@@ -18,6 +18,7 @@ import { pathToFileURL } from "node:url";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { cursorAbout, fetchCursorAcpModels, makeCursorEnv, runCursorAcpTurn } from "./cursor-acp.js";
 import { defaultCursorAcpCommand, makeCursorProbeEnv } from "./cursor-runtime.js";
+import { errorMessage, isAbortLikeError, isRetryableTransientError } from "./errors.js";
 import {
   defaultProviderId as defaultPluginProviderId,
   defaultProviderName as defaultPluginProviderName,
@@ -207,6 +208,10 @@ const COPILOT_DB =
     envKeysForSub("COPILOT_DB", ["SUB_BRIDGE_COPILOT_DB", "CODEXSUB_COPILOT_DB"]),
     join(homedir(), ".copilot", "data.db"),
   );
+const COPILOT_EXTENSION_NAME = "sub-bridge-tools";
+const COPILOT_EXTENSION_DIR =
+  envValue("SUB_BRIDGE_COPILOT_EXTENSION_DIR") ||
+  join(homedir(), ".copilot", "extensions", COPILOT_EXTENSION_NAME);
 const HOST = configValue("host", envKeysForSub("HOST", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"]), "127.0.0.1");
 const PORT = configNumber(
   "port",
@@ -1330,8 +1335,94 @@ async function forwardResponsesPi(req, res, bodyText) {
     throw error;
   }
 
+  const finishOpenPiItems = () => {
+    for (const entry of openItems.values()) {
+      if (entry.kind === "text") {
+        entry.item.status = "completed";
+        entry.item.content[0].text = entry.text;
+        recordWrite("response.output_text.done", {
+          item_id: entry.item.id,
+          output_index: entry.outputIndex,
+          content_index: 0,
+          text: entry.text,
+        });
+        recordWrite("response.content_part.done", {
+          item_id: entry.item.id,
+          output_index: entry.outputIndex,
+          content_index: 0,
+          part: entry.item.content[0],
+        });
+        recordWrite("response.output_item.done", {
+          output_index: entry.outputIndex,
+          item: entry.item,
+        });
+      } else if (entry.kind === "tool") {
+        entry.item.status = "completed";
+        recordWrite("response.function_call_arguments.done", {
+          item_id: entry.item.id,
+          output_index: entry.outputIndex,
+          arguments: entry.item.arguments || entry.args || "{}",
+        });
+        recordWrite("response.output_item.done", {
+          output_index: entry.outputIndex,
+          item: entry.item,
+        });
+      }
+    }
+    openItems.clear();
+  };
+
+  const completeCancelledPiStream = (error) => {
+    const message = errorMessage(error);
+    if (!res.writableEnded && !res.destroyed) {
+      finishOpenPiItems();
+      recordWrite("response.completed", {
+        response: responseObject({
+          id: responseId,
+          model: model.id,
+          status: "completed",
+          output,
+        }),
+      });
+      sseDone(res);
+      res.end();
+    }
+    logLine("responses.cancelled", {
+      status: 200,
+      model: model.id,
+      totalMs: Date.now() - startedAt,
+      message,
+      runtime: "pi",
+    });
+  };
+
+  const failPiStream = (error) => {
+    const message = errorMessage(error) || "Pi stream failed";
+    if (!res.writableEnded && !res.destroyed) {
+      recordWrite("response.failed", {
+        response: responseObject({
+          id: responseId,
+          model: model.id,
+          status: "failed",
+          output,
+          error: { message, type: "bridge_error" },
+        }),
+      });
+      sseDone(res);
+      res.end();
+    }
+    logLine("responses.stream_error", {
+      status: 200,
+      model: model.id,
+      totalMs: Date.now() - startedAt,
+      message,
+      runtime: "pi",
+    });
+  };
+
   let finalMessage = null;
-  for await (const event of piStream) {
+  try {
+    for await (const event of piStream) {
     if (!headerLogged && event.type === "start") {
       headerLogged = true;
       logLine("responses.upstream", {
@@ -1495,6 +1586,10 @@ async function forwardResponsesPi(req, res, bodyText) {
 
     if (event.type === "error") {
       const message = event.error?.errorMessage || "Pi stream failed";
+      if (isAbortLikeError(event.error) || isAbortLikeError(message) || controller.signal.aborted || res.destroyed) {
+        completeCancelledPiStream(event.error || message);
+        return;
+      }
       recordWrite("response.failed", {
         response: responseObject({
           id: responseId,
@@ -1516,6 +1611,23 @@ async function forwardResponsesPi(req, res, bodyText) {
       });
       return;
     }
+  }
+  } catch (error) {
+    if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
+      completeCancelledPiStream(error);
+      return;
+    }
+    if (isRetryableTransientError(error) && output.length === 0) {
+      logLine("responses.retry_skipped", {
+        model: model.id,
+        totalMs: Date.now() - startedAt,
+        message: errorMessage(error),
+        reason: "stream-already-created",
+        runtime: "pi",
+      });
+    }
+    failPiStream(error);
+    return;
   }
 
   if (!finalMessage && !res.writableEnded) {
@@ -1613,11 +1725,11 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
     });
   });
   upstreamStream.on("error", (error) => {
-    logLine("responses.stream_error", {
+    logLine(isAbortLikeError(error) || res.destroyed ? "responses.cancelled" : "responses.stream_error", {
       status: upstream.status,
       model: normalized.info.model,
       totalMs: Date.now() - startedAt,
-      message: error instanceof Error ? error.message : String(error),
+      message: errorMessage(error),
     });
   });
   upstreamStream.pipe(res);
@@ -1640,8 +1752,25 @@ function safeToolIdentifier(value, fallback = "tool") {
   return normalized || fallback;
 }
 
+const CURSOR_COPILOT_TOOL_KINDS = new Set(["execute", "search", "read", "edit", "delete", "move", "fetch", "tool"]);
+
+function cursorToolKind(toolCall) {
+  const kind = safeToolIdentifier(toolCall?.kind || "tool", "tool");
+  return CURSOR_COPILOT_TOOL_KINDS.has(kind) ? kind : "tool";
+}
+
+function cursorToolItemIds(toolCall) {
+  const ids = normalizeToolCallIds({
+    id: `cursor_${safeToolIdentifier(toolCall?.id || randomUUID(), "tool")}`,
+  });
+  return {
+    itemId: ids.itemId,
+    callId: ids.callId,
+  };
+}
+
 function cursorToolName(toolCall) {
-  return `cursor_${safeToolIdentifier(toolCall?.kind || "tool", "tool")}`;
+  return `subbridge_cursor_${cursorToolKind(toolCall)}`;
 }
 
 function cursorToolArguments(toolCall) {
@@ -1657,9 +1786,31 @@ function cursorToolArguments(toolCall) {
   });
 }
 
+function mergeCursorToolCallState(previous, next) {
+  if (!previous) return next;
+  return {
+    ...previous,
+    ...next,
+    kind: next.kind || previous.kind,
+    status: next.status || previous.status,
+    title: next.title || previous.title,
+    command: next.command || previous.command,
+    detail: next.detail || previous.detail,
+    data: {
+      ...(previous.data || {}),
+      ...(next.data || {}),
+    },
+  };
+}
+
+function cursorToolStatusIsTerminal(status) {
+  return status === "completed" || status === "failed";
+}
+
 function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
   let reasoningText = "";
   let assistantText = "";
+  const tools = new Map();
 
   for (const event of Array.isArray(events) ? events : []) {
     if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
@@ -1671,7 +1822,22 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       continue;
     }
     if (event.type === "tool_call") {
-      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(event.toolCall)));
+      const existing = tools.get(event.toolCall.id);
+      const toolCall = mergeCursorToolCallState(existing?.toolCall, event.toolCall);
+      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
+      const ids = cursorToolItemIds(toolCall);
+      const item = existing?.item || {
+        id: ids.itemId,
+        type: "function_call",
+        call_id: ids.callId,
+        name: cursorToolName(toolCall),
+        arguments: "",
+        status: "in_progress",
+      };
+      item.name = cursorToolName(toolCall);
+      item.arguments = cursorToolArguments(toolCall);
+      if (cursorToolStatusIsTerminal(toolCall.status)) item.status = "completed";
+      tools.set(toolCall.id, { item, toolCall });
     }
   }
 
@@ -1683,6 +1849,7 @@ function appendCursorJsonOutputFromEvents(output, events, fallbackText) {
       summary: [{ type: "summary_text", text: reasoningText }],
     });
   }
+  output.push(...Array.from(tools.values()).map((entry) => entry.item));
   const finalText = assistantText || fallbackText;
   if (finalText) {
     output.push({
@@ -1790,6 +1957,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   let nextOutputIndex = 0;
   let assistantEntry = null;
   let reasoningEntry = null;
+  const toolEntries = new Map();
 
   const addOutputItem = (item) => {
     const outputIndex = nextOutputIndex;
@@ -1884,6 +2052,64 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     reasoningEntry = null;
   };
 
+  const applyToolCallEvent = (eventToolCall) => {
+    finishAssistantEntry();
+    finishReasoningEntry();
+    const existingEntry = toolEntries.get(eventToolCall.id);
+    const toolCall = mergeCursorToolCallState(existingEntry?.toolCall, eventToolCall);
+    logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
+    const ids = cursorToolItemIds(toolCall);
+    const name = cursorToolName(toolCall);
+    const args = cursorToolArguments(toolCall);
+    let entry = existingEntry;
+    if (!entry) {
+      const item = {
+        id: ids.itemId,
+        type: "function_call",
+        call_id: ids.callId,
+        name,
+        arguments: "",
+        status: "in_progress",
+      };
+      const outputIndex = addOutputItem(item);
+      entry = { item, outputIndex, argumentsWritten: false, toolCall };
+      toolEntries.set(toolCall.id, entry);
+      recordWrite("response.function_call_arguments.delta", {
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: args,
+      });
+      entry.argumentsWritten = true;
+    }
+    entry.toolCall = toolCall;
+    entry.item.name = name;
+    entry.item.arguments = args;
+    if (cursorToolStatusIsTerminal(toolCall.status) && entry.item.status !== "completed") {
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        name,
+        arguments: args,
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    }
+  };
+
+  const finishOpenToolEntries = () => {
+    for (const entry of toolEntries.values()) {
+      if (entry.item.status === "completed") continue;
+      entry.item.status = "completed";
+      recordWrite("response.function_call_arguments.done", {
+        item_id: entry.item.id,
+        output_index: entry.outputIndex,
+        name: entry.item.name,
+        arguments: entry.item.arguments,
+      });
+      recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
+    }
+  };
+
   const applyCursorEvent = (event) => {
     if (event.type === "content_delta" && event.streamKind === "assistant_text") {
       const entry = ensureAssistantEntry();
@@ -1910,7 +2136,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       return;
     }
     if (event.type === "tool_call") {
-      logLine("cursor.tool_call", JSON.parse(cursorToolArguments(event.toolCall)));
+      applyToolCallEvent(event.toolCall);
     }
   };
 
@@ -1922,6 +2148,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     });
     finishReasoningEntry();
     finishAssistantEntry();
+    finishOpenToolEntries();
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
@@ -1943,9 +2170,36 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       stopReason: result.stopReason,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
+    if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
+      if (!res.writableEnded && !res.destroyed) {
+        finishReasoningEntry();
+        finishAssistantEntry();
+        finishOpenToolEntries();
+        recordWrite("response.completed", {
+          response: responseObject({
+            id: responseId,
+            model: body.model,
+            status: "completed",
+            output,
+          }),
+        });
+        sseDone(res);
+        res.end();
+      }
+      logLine("responses.cancelled", {
+        status: 200,
+        model: body.model,
+        cursorModel: actualCursorModel,
+        totalMs: Date.now() - startedAt,
+        message,
+        runtime: "cursor-acp",
+      });
+      return;
+    }
     finishReasoningEntry();
     finishAssistantEntry();
+    finishOpenToolEntries();
     recordWrite("response.failed", {
       response: responseObject({
         id: responseId,
@@ -2286,6 +2540,12 @@ function copilotDoctor() {
     exists: existsSync(COPILOT_DB),
     sqlite3: commandProbe("sqlite3", ["--version"]),
     providerId: PROVIDER_ID,
+    extension: {
+      name: COPILOT_EXTENSION_NAME,
+      dir: COPILOT_EXTENSION_DIR,
+      entry: join(COPILOT_EXTENSION_DIR, "extension.mjs"),
+      exists: existsSync(join(COPILOT_EXTENSION_DIR, "extension.mjs")),
+    },
     provider: null,
     modelCount: null,
     error: null,
@@ -2998,6 +3258,65 @@ function sqlQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+const COPILOT_CURSOR_TOOL_KINDS = ["execute", "search", "read", "edit", "delete", "move", "fetch", "tool"];
+
+function copilotExtensionSource() {
+  return `import { joinSession } from "@github/copilot-sdk/extension";
+
+const toolKinds = ${JSON.stringify(COPILOT_CURSOR_TOOL_KINDS)};
+
+function formatToolResult(args) {
+  const input = args && typeof args === "object" ? args : {};
+  const lines = [];
+  const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : "SubBridge Cursor tool";
+  lines.push(title);
+  if (typeof input.status === "string" && input.status) lines.push("status: " + input.status);
+  if (typeof input.kind === "string" && input.kind) lines.push("kind: " + input.kind);
+  if (typeof input.detail === "string" && input.detail) lines.push("detail: " + input.detail);
+  if (typeof input.command === "string" && input.command) lines.push("command: " + input.command);
+  if (input.output !== undefined) lines.push("output: " + JSON.stringify(input.output));
+  return lines.join("\\n");
+}
+
+function defineSubBridgeCursorTool(kind) {
+  return {
+    name: "subbridge_cursor_" + kind,
+    description: "Displays a Cursor ACP tool event that was executed by the SubBridge provider runtime.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        status: { type: "string" },
+        kind: { type: "string" },
+        detail: { type: "string" },
+        command: { type: "string" },
+        input: {},
+        output: {},
+        locations: {},
+      },
+      additionalProperties: true,
+    },
+    handler: async (args) => ({
+      resultType: args?.status === "failed" ? "failure" : "success",
+      textResultForLlm: formatToolResult(args),
+    }),
+  };
+}
+
+await joinSession({
+  tools: toolKinds.map(defineSubBridgeCursorTool),
+});
+`;
+}
+
+function installCopilotExtension() {
+  mkdirSync(COPILOT_EXTENSION_DIR, { recursive: true });
+  const entry = join(COPILOT_EXTENSION_DIR, "extension.mjs");
+  writeFileSync(entry, copilotExtensionSource(), { mode: 0o644 });
+  console.log(`installed Copilot extension ${COPILOT_EXTENSION_NAME}`);
+  console.log(`extension=${entry}`);
+}
+
 function installCopilot() {
   const baseUrl = `http://${HOST}:${PORT}/v1`;
   const backup = `${COPILOT_DB}.codexsub-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
@@ -3051,6 +3370,7 @@ on conflict(id) do update set
 
   const sql = `begin;\n${providerSql}\n${deleteModelsSql}\n${modelSql}\ncommit;\n`;
   execFileSync("sqlite3", [COPILOT_DB, sql], { stdio: "inherit" });
+  installCopilotExtension();
   console.log(`installed provider ${PROVIDER_NAME}`);
   console.log(`baseUrl=${baseUrl}`);
   console.log(`wireApi=responses`);

@@ -19,6 +19,7 @@ import {
   defaultProviderTypeForSub,
   providerPluginForType,
 } from "../src/provider-plugins.js";
+import { isAbortLikeError, isRetryableTransientError } from "../src/errors.js";
 
 const root = new URL("..", import.meta.url).pathname;
 const cli = join(root, "src", "cli.js");
@@ -864,14 +865,25 @@ test("cursor bridge streams reasoning and assistant Responses events", async () 
     assert.equal(response.status, 200);
     const types = parseSseTypes(text);
     assert.ok(types.includes("response.reasoning_summary_text.delta"));
+    assert.ok(types.includes("response.output_item.added"));
+    assert.ok(types.includes("response.function_call_arguments.delta"));
+    assert.ok(types.includes("response.function_call_arguments.done"));
     assert.ok(types.includes("response.output_text.delta"));
     assert.ok(types.includes("response.completed"));
-    assert.equal(types.includes("response.function_call_arguments.delta"), false);
+    assert.ok(text.includes('"name":"subbridge_cursor_execute"'));
+    assert.ok(text.includes('\\"command\\":\\"echo pong\\"'));
     assert.equal(text.includes('"name":"cursor_tool"'), false);
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });
   }
+});
+
+test("classifies cancellation and retryable transport errors", () => {
+  assert.equal(isAbortLikeError(new Error("T: [canceled] http/2 stream closed with error code CANCEL (0x8)")), true);
+  assert.equal(isAbortLikeError(Object.assign(new Error("Request was aborted"), { name: "AbortError" })), true);
+  assert.equal(isRetryableTransientError(new Error("fetch failed")), true);
+  assert.equal(isRetryableTransientError(new Error("T: [canceled] http/2 stream closed with error code CANCEL (0x8)")), false);
 });
 
 test("lists provider targets", () => {
@@ -880,6 +892,60 @@ test("lists provider targets", () => {
     { id: "copilot", name: "GitHub Copilot", status: "supported" },
     { id: "cursor", name: "Cursor", status: "planned" },
   ]);
+});
+
+test("install copilot writes provider rows and SubBridge cursor tools extension", () => {
+  try {
+    execFileSync("sqlite3", ["--version"], { stdio: "ignore" });
+  } catch {
+    return;
+  }
+
+  rmSync(testConfig, { force: true });
+  const dir = mkdtempSync(join(tmpdir(), "sub-bridge-copilot-install-"));
+  const dbPath = join(dir, "data.db");
+  const extensionDir = join(dir, "extensions", "sub-bridge-tools");
+  try {
+    execFileSync("sqlite3", [dbPath, `
+create table model_providers (
+  id text primary key,
+  name text,
+  base_url text,
+  wire_api text,
+  azure_api_version text,
+  auth_kind text,
+  headers_json text,
+  type text,
+  settings_json text,
+  updated_at text
+);
+create table provider_models (
+  id text primary key,
+  provider_id text,
+  model_id text,
+  wire_model text,
+  display_name text,
+  max_prompt_tokens integer,
+  max_output_tokens integer,
+  wire_api_override text,
+  updated_at text
+);
+`]);
+    assert.match(run(["--sub", "cursor", "config", "set", "type", "cursor-acp"]), /set type/);
+    const output = run(["--sub", "cursor", "install", "copilot"], {
+      SUB_BRIDGE_COPILOT_DB: dbPath,
+      SUB_BRIDGE_COPILOT_EXTENSION_DIR: extensionDir,
+    });
+    assert.match(output, /installed provider SubBridge/);
+    const extension = readFileSync(join(extensionDir, "extension.mjs"), "utf8");
+    assert.ok(extension.includes('"execute"'));
+    assert.ok(extension.includes('"subbridge_cursor_" + kind'));
+    assert.ok(extension.includes("joinSession"));
+    const count = execFileSync("sqlite3", [dbPath, "select count(*) from provider_models where provider_id='codexsub-openai-codex';"], { encoding: "utf8" }).trim();
+    assert.notEqual(count, "0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("lists bridge models", () => {

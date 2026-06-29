@@ -8,7 +8,7 @@
     "sub-bridge": "./bin/sub-bridge"
   },
   "scripts": {
-    "check": "node --check bin/sub-bridge && node --check src/cli.js && node --check src/cursor-acp.js && node --check src/cursor-models.js && node --check src/cursor-runtime.js && node --check src/provider-plugins.js",
+    "check": "node --check bin/sub-bridge && node --check src/cli.js && node --check src/cursor-acp.js && node --check src/cursor-models.js && node --check src/cursor-runtime.js && node --check src/errors.js && node --check src/provider-plugins.js",
     "ci": "npm run check && bash -n install.sh && bash -n scripts/test-install.sh && npm test && npm run test:install && npm run smoke",
     "test:install": "bash scripts/test-install.sh",
     "test": "node --test",
