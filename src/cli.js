@@ -74,7 +74,7 @@ const PROVIDER_ID = configValue(
   ["SUB_BRIDGE_PROVIDER_ID", "CODEXSUB_PROVIDER_ID"],
   "codexsub-openai-codex",
 );
-const PROVIDER_NAME = configValue("providerName", ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"], "CodexSub");
+const PROVIDER_NAME = configValue("providerName", ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"], "SubBridge");
 const LEGACY_STATE_DIR = join(homedir(), ".local", "state", "gpt-sub-bridge");
 const DEFAULT_STATE_DIR = join(homedir(), ".local", "state", "sub-bridge-cli");
 const USE_LEGACY_STATE = existsSync(join(LEGACY_STATE_DIR, "gpt-sub-bridge.pid"));
@@ -140,25 +140,25 @@ function logLine(message, fields = {}) {
 const MODELS = [
   {
     id: "gpt-5.5",
-    displayName: "CodexSub GPT-5.5",
+    displayName: "SubBridge GPT-5.5",
     contextWindow: 272000,
     maxTokens: 128000,
   },
   {
     id: "gpt-5.4",
-    displayName: "CodexSub GPT-5.4",
+    displayName: "SubBridge GPT-5.4",
     contextWindow: 272000,
     maxTokens: 128000,
   },
   {
     id: "gpt-5.4-mini",
-    displayName: "CodexSub GPT-5.4 mini",
+    displayName: "SubBridge GPT-5.4 mini",
     contextWindow: 272000,
     maxTokens: 128000,
   },
   {
     id: "gpt-5.3-codex-spark",
-    displayName: "CodexSub GPT-5.3 Codex Spark",
+    displayName: "SubBridge GPT-5.3 Codex Spark",
     contextWindow: 128000,
     maxTokens: 128000,
   },
