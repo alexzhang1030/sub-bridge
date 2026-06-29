@@ -289,6 +289,7 @@ test("prints help with project command names", () => {
   assert.match(output, /sub-bridge enable/);
   assert.match(output, /sub-bridge config show/);
   assert.match(output, /sub-bridge config group only <group\.\.\.>/);
+  assert.match(output, /sub-bridge config group preset <latest\|off>/);
   assert.match(output, /sub-bridge install copilot/);
 });
 
@@ -534,6 +535,12 @@ test("cursor model groups enable and disable expanded model families", () => {
     assert.match(run(["--sub", "cursor", "config", "group", "disable", "claude-haiku-4-5"]), /disabled model group family:claude-haiku-4-5/);
     const providerWithFamilyExcluded = JSON.parse(run(["--sub", "cursor", "models"]));
     assert.equal(providerWithFamilyExcluded.data.some((model) => model.id.startsWith("claude-haiku-4-5")), false);
+
+    assert.match(run(["--sub", "cursor", "config", "group", "preset", "latest"]), /set model group preset latest/);
+    assert.equal(JSON.parse(run(["--sub", "cursor", "config", "get", "modelGroups"])).preset, "latest");
+
+    assert.match(run(["--sub", "cursor", "config", "group", "preset", "off"]), /set model group preset off/);
+    assert.equal(JSON.parse(run(["--sub", "cursor", "config", "get", "modelGroups"])).preset, "");
   } finally {
     rmSync(mock.dir, { recursive: true, force: true });
   }
@@ -658,6 +665,71 @@ test("cursor model variants follow Synara base plus raw variant shape", () => {
   ]);
   assert.deepEqual(composerModels.map((model) => model.id), ["composer-2.5", "composer-2.5[fast=true]"]);
   assert.deepEqual(composerModels.map((model) => model.displayName), ["Composer 2.5", "Composer 2.5 Fast"]);
+
+  const latestPresetModels = filterCursorModelsByGroups(mergeCursorModelVariantsWithBaseControls([
+    {
+      id: "claude-opus-4-8",
+      displayName: "Opus 4.8",
+      contextWindow: 1000000,
+      maxTokens: 128000,
+      upstreamProviderId: "anthropic",
+      upstreamProviderName: "Anthropic",
+      supportedReasoningEfforts: [{ value: "high", label: "High" }],
+      defaultReasoningEffort: "high",
+      supportsFastMode: true,
+      supportsThinking: true,
+      contextWindowOptions: [{ value: "1m", label: "1M", isDefault: true }],
+      defaultContextWindow: "1m",
+    },
+    {
+      id: "gpt-5.5",
+      displayName: "GPT-5.5",
+      contextWindow: 1000000,
+      maxTokens: 128000,
+      upstreamProviderId: "openai",
+      upstreamProviderName: "OpenAI",
+      supportedReasoningEfforts: [{ value: "medium", label: "Medium" }],
+      defaultReasoningEffort: "medium",
+      supportsFastMode: true,
+      contextWindowOptions: [{ value: "1m", label: "1M", isDefault: true }],
+      defaultContextWindow: "1m",
+    },
+    {
+      id: "composer-2.5",
+      displayName: "Composer 2.5",
+      contextWindow: 128000,
+      maxTokens: 128000,
+      supportsFastMode: true,
+    },
+    {
+      id: "glm-5.2",
+      displayName: "GLM 5.2",
+      contextWindow: 128000,
+      maxTokens: 128000,
+    },
+  ]), { preset: "latest" });
+  assert.deepEqual(latestPresetModels.map((model) => model.displayName), [
+    "Opus 4.8",
+    "Opus 4.8 Fast",
+    "Opus 4.8 Thinking",
+    "Opus 4.8 Thinking Fast",
+    "GPT-5.5",
+    "GPT-5.5 Fast",
+    "Composer 2.5",
+    "Composer 2.5 Fast",
+    "GLM 5.2",
+  ]);
+  assert.deepEqual(latestPresetModels.map((model) => model.id), [
+    "claude-opus-4-8[context=1m,effort=high]",
+    "claude-opus-4-8[context=1m,effort=high,fast=true]",
+    "claude-opus-4-8[context=1m,effort=high,thinking=true]",
+    "claude-opus-4-8[context=1m,effort=high,fast=true,thinking=true]",
+    "gpt-5.5[context=1m,effort=medium]",
+    "gpt-5.5[context=1m,effort=medium,fast=true]",
+    "composer-2.5",
+    "composer-2.5[fast=true]",
+    "glm-5.2",
+  ]);
 
   const models = mergeCursorModelVariantsWithBaseControls([
     {

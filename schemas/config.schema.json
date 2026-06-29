@@ -82,6 +82,9 @@
         "only": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
+        },
+        "preset": {
+          "enum": ["", "latest"]
         }
       }
     },

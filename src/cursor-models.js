@@ -664,6 +664,35 @@ function dedupeCursorModelsByVisibleName(models) {
   return entries;
 }
 
+const CURSOR_MODEL_PRESETS = {
+  latest: [
+    { id: "claude-opus-4-8[context=1m,effort=high]", displayName: "Opus 4.8" },
+    { id: "claude-opus-4-8[context=1m,effort=high,fast=true]", displayName: "Opus 4.8 Fast" },
+    { id: "claude-opus-4-8[context=1m,effort=high,thinking=true]", displayName: "Opus 4.8 Thinking" },
+    { id: "claude-opus-4-8[context=1m,effort=high,fast=true,thinking=true]", displayName: "Opus 4.8 Thinking Fast" },
+    { id: "gpt-5.5[context=1m,effort=medium]", displayName: "GPT-5.5" },
+    { id: "gpt-5.5[context=1m,effort=medium,fast=true]", displayName: "GPT-5.5 Fast" },
+    { id: "composer-2.5", displayName: "Composer 2.5" },
+    { id: "composer-2.5[fast=true]", displayName: "Composer 2.5 Fast" },
+    { id: "glm-5.2", displayName: "GLM 5.2" },
+  ],
+};
+
+function normalizeCursorModelPreset(value) {
+  const preset = String(value || "").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(CURSOR_MODEL_PRESETS, preset) ? preset : "";
+}
+
+function applyCursorModelPreset(models, preset) {
+  const rules = CURSOR_MODEL_PRESETS[preset] || [];
+  if (rules.length === 0) return models;
+  const byId = new Map((Array.isArray(models) ? models : []).map((model) => [String(model?.id || "").trim(), model]));
+  return rules.flatMap((rule) => {
+    const model = byId.get(rule.id);
+    return model ? [{ ...model, displayName: rule.displayName }] : [];
+  });
+}
+
 export function cursorModelGroupEntries(model) {
   const providerId = String(model?.upstreamProviderId || "cursor").trim().toLowerCase() || "cursor";
   const providerName = String(model?.upstreamProviderName || "Cursor").trim() || "Cursor";
@@ -681,6 +710,7 @@ export function normalizeModelGroupsConfig(config) {
   return {
     disabled: Array.from(new Set(disabled.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
     only: Array.from(new Set(only.map((value) => String(value || "").trim()).filter(Boolean))),
+    preset: normalizeCursorModelPreset(config?.preset),
   };
 }
 
@@ -689,7 +719,7 @@ export function filterCursorModelsByGroups(models, config) {
   const disabled = new Set(groupsConfig.disabled);
   const only = new Set(groupsConfig.only);
   const normalized = Array.isArray(models) ? models : [];
-  if (disabled.size === 0 && only.size === 0) return normalized;
+  if (disabled.size === 0 && only.size === 0) return applyCursorModelPreset(normalized, groupsConfig.preset);
   const onlyOrder = new Map(groupsConfig.only.map((groupId, index) => [groupId, index]));
   const filtered = normalized.flatMap((model, index) => {
     const groupIds = cursorModelGroupEntries(model).map((group) => group.id);
@@ -702,9 +732,10 @@ export function filterCursorModelsByGroups(models, config) {
     }, Number.MAX_SAFE_INTEGER);
     return [{ model, index, groupOrder }];
   });
-  return filtered
+  const grouped = filtered
     .sort((left, right) => left.groupOrder - right.groupOrder || left.index - right.index)
     .map((entry) => entry.model);
+  return applyCursorModelPreset(grouped, groupsConfig.preset);
 }
 
 export function summarizeCursorModelGroups(models, config) {

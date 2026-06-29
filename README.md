@@ -108,10 +108,14 @@ sub-bridge --sub cursor config groups
 sub-bridge --sub cursor config group disable provider:anthropic
 sub-bridge --sub cursor config group enable claude-opus-4-8
 sub-bridge --sub cursor config group only claude-opus-4-8 gpt-5.5 composer-2.5 glm-5.2
+sub-bridge --sub cursor config group preset latest
 sub-bridge --sub cursor config group reset
 ```
 
 Group filters affect `models`, serving, and Copilot registration.
+The `latest` preset keeps a short Copilot menu: Opus 4.8, Opus 4.8 Fast,
+Opus 4.8 Thinking, Opus 4.8 Thinking Fast, GPT-5.5, GPT-5.5 Fast,
+Composer 2.5, Composer 2.5 Fast, and GLM 5.2.
 
 Runtime overrides stay in env vars, for example:
 
