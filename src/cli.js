@@ -2736,7 +2736,7 @@ function resolveCursorModelGroupId(value) {
 
 function resolveCursorModelGroupIds(values) {
   const groupIds = values.map(resolveCursorModelGroupId);
-  return Array.from(new Set(groupIds)).sort();
+  return Array.from(new Set(groupIds));
 }
 
 function writeCursorModelGroupState(groupId, enabled) {
@@ -2754,7 +2754,7 @@ function writeCursorModelGroupState(groupId, enabled) {
     }
     writeActiveConfigValue("modelGroups", {
       disabled: Array.from(disabled).sort(),
-      only: Array.from(only).sort(),
+      only: Array.from(only),
     });
     return;
   }
@@ -2762,12 +2762,12 @@ function writeCursorModelGroupState(groupId, enabled) {
   else disabled.add(groupId);
   writeActiveConfigValue("modelGroups", {
     disabled: Array.from(disabled).sort(),
-    only: Array.from(only).sort(),
+    only: Array.from(only),
   });
 }
 
 function writeCursorModelGroupOnly(groupIds) {
-  writeActiveConfigValue("modelGroups", { disabled: [], only: Array.from(new Set(groupIds)).sort() });
+  writeActiveConfigValue("modelGroups", { disabled: [], only: Array.from(new Set(groupIds)) });
 }
 
 function resetCursorModelGroups() {

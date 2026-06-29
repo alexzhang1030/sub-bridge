@@ -680,6 +680,24 @@ test("cursor model variants follow Synara base plus raw variant shape", () => {
   assert.deepEqual(filterCursorModelsByGroups(models, { only: ["family:claude-opus-4-8"] }), models);
   assert.deepEqual(filterCursorModelsByGroups(models, { only: ["provider:openai"] }), []);
 
+  const ordered = filterCursorModelsByGroups([
+    {
+      id: "composer-2.5",
+      displayName: "Composer 2.5",
+      contextWindow: 128000,
+      maxTokens: 128000,
+    },
+    {
+      id: "claude-opus-4-8",
+      displayName: "Opus 4.8",
+      contextWindow: 300000,
+      maxTokens: 128000,
+      upstreamProviderId: "anthropic",
+      upstreamProviderName: "Anthropic",
+    },
+  ], { only: ["family:claude-opus-4-8", "family:composer-2.5"] });
+  assert.deepEqual(ordered.map((model) => model.id), ["claude-opus-4-8", "composer-2.5"]);
+
   const onlyGroups = summarizeCursorModelGroups(models, { only: ["family:claude-opus-4-8"] });
   assert.equal(onlyGroups.find((group) => group.id === "family:claude-opus-4-8")?.activeModelCount, models.length);
   assert.equal(onlyGroups.find((group) => group.id === "provider:anthropic")?.activeModelCount, models.length);

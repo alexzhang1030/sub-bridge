@@ -648,7 +648,7 @@ export function normalizeModelGroupsConfig(config) {
   const only = Array.isArray(config?.only) ? config.only : [];
   return {
     disabled: Array.from(new Set(disabled.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
-    only: Array.from(new Set(only.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
+    only: Array.from(new Set(only.map((value) => String(value || "").trim()).filter(Boolean))),
   };
 }
 
@@ -656,13 +656,23 @@ export function filterCursorModelsByGroups(models, config) {
   const groupsConfig = normalizeModelGroupsConfig(config);
   const disabled = new Set(groupsConfig.disabled);
   const only = new Set(groupsConfig.only);
-  if (disabled.size === 0 && only.size === 0) return Array.isArray(models) ? models : [];
-  return (Array.isArray(models) ? models : []).filter((model) => {
+  const normalized = Array.isArray(models) ? models : [];
+  if (disabled.size === 0 && only.size === 0) return normalized;
+  const onlyOrder = new Map(groupsConfig.only.map((groupId, index) => [groupId, index]));
+  const filtered = normalized.flatMap((model, index) => {
     const groupIds = cursorModelGroupEntries(model).map((group) => group.id);
     const selected = only.size === 0 || groupIds.some((groupId) => only.has(groupId));
     const enabled = groupIds.every((groupId) => !disabled.has(groupId));
-    return selected && enabled;
+    if (!selected || !enabled) return [];
+    const groupOrder = groupIds.reduce((lowest, groupId) => {
+      const order = onlyOrder.get(groupId);
+      return order === undefined ? lowest : Math.min(lowest, order);
+    }, Number.MAX_SAFE_INTEGER);
+    return [{ model, index, groupOrder }];
   });
+  return filtered
+    .sort((left, right) => left.groupOrder - right.groupOrder || left.index - right.index)
+    .map((entry) => entry.model);
 }
 
 export function summarizeCursorModelGroups(models, config) {
