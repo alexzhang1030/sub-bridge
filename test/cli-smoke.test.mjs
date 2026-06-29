@@ -9,6 +9,7 @@ import {
   cursorOptionsFromModelEntry,
   filterCursorModelsByGroups,
   mergeCursorModelVariantsWithBaseControls,
+  normalizeCursorModelVariantBaseId,
   summarizeCursorModelGroups,
 } from "../src/cursor-models.js";
 import {
@@ -605,6 +606,9 @@ test("cursor model options preserve legacy off as fast mode off", () => {
 });
 
 test("cursor model variants follow Synara base plus raw variant shape", () => {
+  assert.equal(normalizeCursorModelVariantBaseId("claude-opus-4-8-thinking-max"), "claude-opus-4-8");
+  assert.equal(normalizeCursorModelVariantBaseId("gpt-5.1-codex-max-medium-fast"), "gpt-5.1-codex-max");
+
   const models = mergeCursorModelVariantsWithBaseControls([
     {
       id: "claude-opus-4-8",

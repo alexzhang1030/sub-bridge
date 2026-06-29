@@ -355,14 +355,19 @@ export function parseCursorCliModelList(stdout) {
 
 function normalizeCursorCliBaseModelId(model) {
   const trimmed = String(model || "").trim();
-  const withoutVariantSuffixes = trimmed
-    .replace(/-fast$/u, "")
-    .replace(/-(?:extra-high|none|low|medium|high|xhigh)$/u, "")
-    .replace(/-thinking$/u, "")
-    .replace(/-fast$/u, "")
-    .replace(/-(?:extra-high|none|low|medium|high|xhigh)$/u, "")
+  let withoutVariantSuffixes = trimmed
     .replace(/^claude-(\d+(?:\.\d+)?)-([a-z]+)-max$/u, "claude-$1-$2")
     .replace(/-preview$/u, "");
+  for (let index = 0; index < 3; index += 1) {
+    const next = withoutVariantSuffixes
+      .replace(/-fast$/u, "")
+      .replace(/-thinking$/u, "")
+      .replace(/-(?:extra-high|none|low|medium|high|xhigh)$/u, "");
+    withoutVariantSuffixes =
+      next.endsWith("-max") && !next.includes("codex-max")
+        ? next.slice(0, -"-max".length)
+        : next;
+  }
 
   const claudeReordered = withoutVariantSuffixes.match(/^claude-(\d+(?:\.\d+)?)-([a-z]+)$/u);
   if (claudeReordered) {
