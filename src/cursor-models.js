@@ -926,6 +926,34 @@ function findCursorModelChoiceWithSupportedParameters(choices, model) {
   return choices.find((choice) => cursorModelChoiceSupportsRequestedParameters(choice.slug, model))?.slug;
 }
 
+function cursorCliStyleOptionsMatch(choice, requestedBaseModel, requestedOptions) {
+  if (String(choice?.slug || "").includes("[")) return false;
+  const choiceBase = normalizeCursorModelVariantBaseId(choice.slug);
+  const requestedBase = normalizeCursorCliBaseModelId(requestedBaseModel);
+  if (choiceBase !== requestedBase) return false;
+
+  const choiceOptions = cursorModelOptionsFromCliModelId(choice.slug);
+  if (requestedOptions?.reasoningEffort) {
+    const left = normalizeCursorReasoningValue(choiceOptions.reasoningEffort);
+    const right = normalizeCursorReasoningValue(requestedOptions.reasoningEffort);
+    if (left && left !== right) return false;
+  }
+  if (requestedOptions?.contextWindow && choiceOptions.contextWindow) {
+    if (normalizedText(choiceOptions.contextWindow) !== normalizedText(requestedOptions.contextWindow)) return false;
+  }
+  if (typeof requestedOptions?.fastMode === "boolean") {
+    if (Boolean(choiceOptions.fastMode) !== requestedOptions.fastMode) return false;
+  }
+  if (typeof requestedOptions?.thinking === "boolean") {
+    if (Boolean(choiceOptions.thinking) !== requestedOptions.thinking) return false;
+  }
+  return true;
+}
+
+function findCursorCliStyleVariantChoice(choices, baseModel, options) {
+  return choices.find((choice) => cursorCliStyleOptionsMatch(choice, baseModel, options))?.slug;
+}
+
 export function resolveCursorAcpModelValue(configOptions, model, options) {
   const trimmed = String(model || "").trim();
   if (!trimmed) return undefined;
@@ -938,17 +966,21 @@ export function resolveCursorAcpModelValue(configOptions, model, options) {
   const baseModel = resolveCursorAcpBaseModelId(trimmed);
   if (baseModel === "auto") return undefined;
   const cliBaseModel = normalizeCursorCliBaseModelId(baseModel);
-  const acpModelValue =
+  const matchedAcpModelValue =
     choices.find((choice) => choice.slug === baseModel)?.slug ||
     choices.find((choice) => resolveCursorAcpBaseModelId(choice.slug) === baseModel)?.slug ||
-    choices.find((choice) => resolveCursorAcpBaseModelId(choice.slug) === cliBaseModel)?.slug ||
-    baseModel;
+    choices.find((choice) => resolveCursorAcpBaseModelId(choice.slug) === cliBaseModel)?.slug;
+  const acpModelValue = matchedAcpModelValue || resolveCursorAutoModelValue(choices);
+  if (!acpModelValue) return undefined;
 
   const inferredOptions = mergeCursorModelOptions(
     cursorModelOptionsFromModelParameters(trimmed),
     cursorModelOptionsFromCliModelId(trimmed),
     options,
   );
+  const cliStyleVariant = findCursorCliStyleVariantChoice(choices, baseModel, inferredOptions);
+  if (cliStyleVariant) return cliStyleVariant;
+
   const resolvedModel =
     buildCursorParameterizedModelFromOptions({
       acpModelValue,
@@ -960,7 +992,7 @@ export function resolveCursorAcpModelValue(configOptions, model, options) {
   return (
     findCursorModelChoiceIgnoringFast(choices, resolvedModel) ||
     findCursorModelChoiceWithSupportedParameters(choices, resolvedModel) ||
-    resolvedModel
+    (acpModelValue.includes("[") ? resolvedModel : acpModelValue)
   );
 }
 

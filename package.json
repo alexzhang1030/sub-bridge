@@ -1,6 +1,6 @@
 {
   "name": "sub-bridge-cli",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "description": "Local OpenAI Responses bridge for subscription-backed coding agents.",

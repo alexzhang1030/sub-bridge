@@ -10,6 +10,7 @@ import {
   filterCursorModelsByGroups,
   mergeCursorModelVariantsWithBaseControls,
   normalizeCursorModelVariantBaseId,
+  resolveCursorAcpModelValue,
   summarizeCursorModelGroups,
 } from "../src/cursor-models.js";
 import {
@@ -37,7 +38,7 @@ function run(args, env = {}) {
   });
 }
 
-function createMockCursorAgent({ failMemoryAuth = false, availableModels = true, cliModels = [] } = {}) {
+function createMockCursorAgent({ failMemoryAuth = false, availableModels = true, cliModels = [], extraModelOptions = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "sub-bridge-cursor-agent-"));
   const command = join(dir, "agent.mjs");
   writeFileSync(command, `#!/usr/bin/env node
@@ -47,6 +48,7 @@ import { appendFileSync } from "node:fs";
 const failMemoryAuth = ${JSON.stringify(failMemoryAuth)};
 const availableModels = ${JSON.stringify(availableModels)};
 const cliModels = ${JSON.stringify(cliModels)};
+const extraModelOptions = ${JSON.stringify(extraModelOptions)};
 const args = process.argv.slice(2);
 if (args.includes("models")) {
   if (process.env.MOCK_CLI_ARGS_PATH) {
@@ -66,6 +68,7 @@ const modelConfigOptions = [
     type: "select",
     options: [
       { value: "cursor-fast", name: "Cursor Fast" },
+      ...extraModelOptions,
       { options: [
         { value: "cursor-deep", name: "Cursor Deep" },
         { value: "claude-haiku-4-5[thinking=false,context=200k,effort=high,fast=false]", name: "Haiku 4.5" }
@@ -199,6 +202,14 @@ rl.on("line", (line) => {
     return;
   }
   if (request.method === "session/prompt") {
+    if (process.env.MOCK_CURSOR_PROMPT_ERROR) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32602, message: process.env.MOCK_CURSOR_PROMPT_ERROR }
+      }) + "\\n");
+      return;
+    }
     if (process.env.MOCK_CURSOR_EVENTS === "1") {
       const notify = (update) => process.stdout.write(JSON.stringify({
         jsonrpc: "2.0",
@@ -632,6 +643,38 @@ test("cursor ACP sets requested model and per-model options", async () => {
   }
 });
 
+test("cursor ACP config maps Composer fast model to supported ACP choice", async () => {
+  const mock = createMockCursorAgent({
+    extraModelOptions: [
+      { value: "composer-2.5", name: "Composer 2.5" },
+      { value: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+    ],
+  });
+  const capturePath = join(mock.dir, "capture.jsonl");
+  try {
+    await runCursorAcpTurn({
+      command: mock.command,
+      workspace: root,
+      env: {
+        ...process.env,
+        MOCK_CAPTURE_PATH: capturePath,
+      },
+      timeoutMs: 5000,
+      model: "composer-2.5[fast=true]",
+      modelOptions: { fastMode: true },
+      body: { input: "你好" },
+    });
+
+    const writes = readFileSync(capturePath, "utf8")
+      .trim()
+      .split(/\n/)
+      .map((line) => JSON.parse(line));
+    assert.ok(writes.some((entry) => entry.configId === "model" && entry.value === "composer-2.5-fast"));
+  } finally {
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
 test("cursor model options preserve legacy off as fast mode off", () => {
   assert.deepEqual(cursorOptionsFromModelEntry({
     id: "claude-haiku-4-5",
@@ -795,6 +838,24 @@ test("cursor model variants follow Synara base plus raw variant shape", () => {
   assert.equal(onlyGroups.find((group) => group.id === "provider:anthropic")?.activeModelCount, models.length);
 });
 
+test("cursor ACP resolves parameterized fast variants to CLI-style choices", () => {
+  const configOptions = [{
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    options: [
+      { value: "composer-2.5", name: "Composer 2.5" },
+      { value: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+    ],
+  }];
+
+  assert.equal(
+    resolveCursorAcpModelValue(configOptions, "composer-2.5[fast=true]", { fastMode: true }),
+    "composer-2.5-fast",
+  );
+});
+
 test("cursor ACP surfaces reasoning, tool calls, and assistant events", async () => {
   const mock = createMockCursorAgent();
   try {
@@ -872,6 +933,53 @@ test("cursor bridge streams reasoning and assistant Responses events", async () 
     assert.equal(types.includes("response.function_call_arguments.done"), false);
     assert.ok(text.includes("[cursor:execute:pending] Ran command - echo pong"));
     assert.equal(text.includes('"name":"cursor_tool"'), false);
+  } finally {
+    if (child && !child.killed) child.kill("SIGTERM");
+    rmSync(mock.dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor bridge completes stream with visible assistant text on Cursor ACP errors", async () => {
+  rmSync(testConfig, { force: true });
+  const mock = createMockCursorAgent();
+  const port = String(26000 + (process.pid % 10000));
+  let child = null;
+  try {
+    assert.match(run(["--sub", "cursor-error", "config", "set", "type", "cursor-acp"]), /set type/);
+    assert.match(run(["--sub", "cursor-error", "config", "set", "port", port]), /set port/);
+    assert.match(run(["--sub", "cursor-error", "config", "set", "models", JSON.stringify([
+      { id: "composer-2.5[fast=true]", displayName: "Composer 2.5 Fast", contextWindow: 128000, maxTokens: 128000 },
+    ])]), /set models/);
+
+    child = spawn(process.execPath, [cli, "--sub", "cursor-error", "serve"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SUB_BRIDGE_CONFIG: testConfig,
+        SUB_BRIDGE_CURSOR_ACP_COMMAND: mock.command,
+        MOCK_CURSOR_PROMPT_ERROR: "Invalid params: Invalid model value: composer-2.5",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitForUrl(`http://127.0.0.1:${port}/v1/models`);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2.5[fast=true]",
+        stream: true,
+        input: "你好",
+      }),
+    });
+    const text = await response.text();
+    const types = parseSseTypes(text);
+    assert.equal(response.status, 200);
+    assert.equal(types.includes("response.failed"), false);
+    assert.ok(types.includes("response.output_text.delta"));
+    assert.ok(types.includes("response.completed"));
+    assert.ok(text.includes("Cursor ACP error: Invalid params: Invalid model value: composer-2.5"));
+    assert.ok(text.includes("data: [DONE]"));
   } finally {
     if (child && !child.killed) child.kill("SIGTERM");
     rmSync(mock.dir, { recursive: true, force: true });

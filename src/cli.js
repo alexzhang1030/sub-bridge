@@ -2006,6 +2006,46 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     assistantEntry = null;
   };
 
+  const emitAssistantTextItem = (text) => {
+    const item = {
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      status: "in_progress",
+      role: "assistant",
+      content: [],
+    };
+    const outputIndex = addOutputItem(item);
+    const part = { type: "output_text", text: "", annotations: [] };
+    item.content.push(part);
+    recordWrite("response.content_part.added", {
+      item_id: item.id,
+      output_index: outputIndex,
+      content_index: 0,
+      part,
+    });
+    part.text = text;
+    recordWrite("response.output_text.delta", {
+      item_id: item.id,
+      output_index: outputIndex,
+      content_index: 0,
+      delta: text,
+    });
+    item.status = "completed";
+    recordWrite("response.output_text.done", {
+      item_id: item.id,
+      output_index: outputIndex,
+      content_index: 0,
+      text,
+    });
+    recordWrite("response.content_part.done", {
+      item_id: item.id,
+      output_index: outputIndex,
+      content_index: 0,
+      part,
+    });
+    recordWrite("response.output_item.done", { output_index: outputIndex, item });
+  };
+
   const ensureReasoningEntry = () => {
     if (reasoningEntry) return reasoningEntry;
     const item = {
@@ -2169,13 +2209,13 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     finishReasoningEntry();
     finishAssistantEntry();
     finishOpenToolEntries();
-    recordWrite("response.failed", {
+    emitAssistantTextItem(`Cursor ACP error: ${message}`);
+    recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
         model: body.model,
-        status: "failed",
+        status: "completed",
         output,
-        error: { message, type: "bridge_error" },
       }),
     });
     sseDone(res);
