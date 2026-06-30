@@ -1,18 +1,16 @@
-function asRecord(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
-}
+import { asRecord } from "./lib/record";
 
-function asTrimmedString(value) {
+function asTrimmedString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function normalizeCommandValue(value) {
+function normalizeCommandValue(value: unknown): string | undefined {
   const direct = asTrimmedString(value);
   if (direct) return direct;
   if (!Array.isArray(value)) return undefined;
-  const parts = [];
+  const parts: string[] = [];
   for (const entry of value) {
     const part = asTrimmedString(entry);
     if (part !== undefined) parts.push(part);
@@ -20,7 +18,7 @@ function normalizeCommandValue(value) {
   return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
-function stripTrailingExitCode(value) {
+function stripTrailingExitCode(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
   const match = /^(?<output>[\s\S]*?)(?:\s*<exited with exit code \d+>)\s*$/iu.exec(trimmed);
@@ -28,22 +26,23 @@ function stripTrailingExitCode(value) {
   return output.length > 0 ? output : undefined;
 }
 
-function extractCommandFromTitle(title) {
+function extractCommandFromTitle(title: string | undefined): string | undefined {
   if (!title) return undefined;
   const backtickMatch = /`([^`]+)`/u.exec(title);
   return backtickMatch?.[1]?.trim() || undefined;
 }
 
-export function extractToolCommand(data, title) {
-  const item = asRecord(data?.item);
+export function extractToolCommand(data: unknown, title: string | undefined): string | undefined {
+  const record = asRecord(data);
+  const item = asRecord(record?.item);
   const itemInput = asRecord(item?.input);
   const itemResult = asRecord(item?.result);
-  const rawInput = asRecord(data?.rawInput);
+  const rawInput = asRecord(record?.rawInput);
   const candidates = [
     normalizeCommandValue(item?.command),
     normalizeCommandValue(itemInput?.command),
     normalizeCommandValue(itemResult?.command),
-    normalizeCommandValue(data?.command),
+    normalizeCommandValue(record?.command),
     normalizeCommandValue(rawInput?.command),
   ];
   const direct = candidates.find((candidate) => candidate !== undefined);
@@ -55,7 +54,7 @@ export function extractToolCommand(data, title) {
   return extractCommandFromTitle(title);
 }
 
-function maybePathLike(value) {
+function maybePathLike(value: string): string | undefined {
   if (!value) return undefined;
   if (
     value.includes("/") ||
@@ -68,7 +67,7 @@ function maybePathLike(value) {
   return undefined;
 }
 
-function collectPaths(value, paths, seen, depth) {
+function collectPaths(value: unknown, paths: string[], seen: Set<string>, depth: number): void {
   if (depth > 4 || paths.length >= 8) return;
   if (Array.isArray(value)) {
     for (const entry of value) {
@@ -80,7 +79,7 @@ function collectPaths(value, paths, seen, depth) {
   const record = asRecord(value);
   if (!record) return;
   for (const key of ["path", "filePath", "relativePath", "filename", "newPath", "oldPath"]) {
-    const candidate = maybePathLike(asTrimmedString(record[key]));
+    const candidate = maybePathLike(asTrimmedString(record[key]) ?? "");
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
     paths.push(candidate);
@@ -93,13 +92,13 @@ function collectPaths(value, paths, seen, depth) {
   }
 }
 
-function extractPrimaryPath(data) {
-  const paths = [];
+function extractPrimaryPath(data: unknown): string | undefined {
+  const paths: string[] = [];
   collectPaths(data, paths, new Set(), 0);
   return paths[0];
 }
 
-function normalizeEquivalentValue(value) {
+function normalizeEquivalentValue(value: unknown): string | undefined {
   const trimmed = asTrimmedString(value);
   if (!trimmed) return undefined;
   return trimmed
@@ -108,13 +107,13 @@ function normalizeEquivalentValue(value) {
     .trim();
 }
 
-function isEquivalent(left, right) {
+function isEquivalent(left: unknown, right: unknown): boolean {
   const normalizedLeft = normalizeEquivalentValue(left)?.toLowerCase();
   const normalizedRight = normalizeEquivalentValue(right)?.toLowerCase();
   return normalizedLeft !== undefined && normalizedLeft === normalizedRight;
 }
 
-export function canonicalItemTypeFromAcpToolKind(kind) {
+export function canonicalItemTypeFromAcpToolKind(kind: string | undefined): string {
   switch (kind) {
     case "execute":
       return "command_execution";
@@ -130,9 +129,16 @@ export function canonicalItemTypeFromAcpToolKind(kind) {
   }
 }
 
-function classifyToolAction(input) {
+interface ClassifyToolActionInput {
+  itemType?: string;
+  title?: string;
+  data?: Record<string, unknown>;
+}
+
+function classifyToolAction(input: ClassifyToolActionInput): string {
   const itemType = input.itemType ?? undefined;
-  const kind = asTrimmedString(input.data?.kind)?.toLowerCase();
+  const data = input.data;
+  const kind = asTrimmedString(data?.kind)?.toLowerCase();
   const title = asTrimmedString(input.title)?.toLowerCase();
   if (itemType === "command_execution" || kind === "execute" || title === "terminal") {
     return "command";
@@ -155,7 +161,20 @@ function classifyToolAction(input) {
   return "other";
 }
 
-export function deriveToolActivityPresentation(input) {
+export interface ToolActivityPresentationInput {
+  itemType?: string;
+  title?: string;
+  detail?: string;
+  fallbackSummary?: string;
+  data?: unknown;
+}
+
+export interface ToolActivityPresentation {
+  summary: string;
+  detail?: string;
+}
+
+export function deriveToolActivityPresentation(input: ToolActivityPresentationInput): ToolActivityPresentation {
   const title = asTrimmedString(input.title);
   const detail = stripTrailingExitCode(asTrimmedString(input.detail));
   const fallbackSummary = asTrimmedString(input.fallbackSummary) ?? "Tool";

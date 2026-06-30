@@ -1,12 +1,14 @@
-function cleanType(value) {
+import type { ProviderPlugin, ProviderPluginContext } from "./types/provider";
+
+function cleanType(value: unknown): string {
   return String(value || "").trim().toLowerCase();
 }
 
-function cleanSub(value) {
+function cleanSub(value: unknown): string {
   return cleanType(value).replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-function titleCase(value) {
+function titleCase(value: unknown): string {
   return String(value || "")
     .split(/[-_\s]+/g)
     .filter(Boolean)
@@ -14,7 +16,7 @@ function titleCase(value) {
     .join(" ");
 }
 
-export const cursorAcpProviderPlugin = {
+export const cursorAcpProviderPlugin: ProviderPlugin = {
   id: "cursor-acp",
   aliases: ["cursor"],
   defaultSubNames: ["cursor"],
@@ -83,7 +85,7 @@ export const cursorAcpProviderPlugin = {
   },
 };
 
-export const codexProviderPlugin = {
+export const codexProviderPlugin: ProviderPlugin = {
   id: "codex",
   aliases: [],
   defaultSubNames: ["codex"],
@@ -144,35 +146,37 @@ export const codexProviderPlugin = {
   },
 };
 
-export const PROVIDER_PLUGINS = [
+export const PROVIDER_PLUGINS: ProviderPlugin[] = [
   cursorAcpProviderPlugin,
   codexProviderPlugin,
 ];
 
-export function exactProviderPluginForType(type) {
+export function exactProviderPluginForType(type: string): ProviderPlugin | null {
   return PROVIDER_PLUGINS.find((plugin) => plugin.matchesType(type)) || null;
 }
 
-export function providerPluginForType(type) {
+export function providerPluginForType(type: string): ProviderPlugin {
   return exactProviderPluginForType(type) || codexProviderPlugin;
 }
 
-export function defaultProviderTypeForSub(subName) {
+export function defaultProviderTypeForSub(subName: string): string {
   return PROVIDER_PLUGINS.find((plugin) => plugin.matchesSubName(subName))?.id || codexProviderPlugin.id;
 }
 
-export function defaultProviderPort(subName, type) {
+export function defaultProviderPort(subName: string, type: string): number {
   return exactProviderPluginForType(type)?.defaultPort || (cleanSub(subName) ? 17876 : cursorAcpProviderPlugin.defaultPort);
 }
 
-export function defaultProviderId(subName, type) {
+export function defaultProviderId(subName: string, type: string): string {
   const plugin = exactProviderPluginForType(type);
   if (plugin) return plugin.defaultProviderId;
   return `subbridge-${cleanSub(subName) || "default"}`;
 }
 
-export function defaultProviderName(subName, type) {
+export function defaultProviderName(subName: string, type: string): string {
   const plugin = exactProviderPluginForType(type);
   if (plugin) return plugin.defaultProviderName;
   return `SubBridge ${titleCase(cleanSub(subName) || "default")}`;
 }
+
+export type { ProviderPluginContext };

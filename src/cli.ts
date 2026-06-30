@@ -1,5 +1,10 @@
-// @ts-nocheck — remove after cli.ts is split into typed modules
 import { createServer } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { AcpProcessorEvent } from "./types/acp";
+import type { ConfigFile, SubscriptionConfig } from "./types/config";
+import type { CursorModelEntry } from "./types/cursor";
+import type { ProviderPluginContext } from "./types/provider";
+import { isPlainObject } from "./lib/record";
 import { Readable } from "node:stream";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
@@ -69,7 +74,7 @@ import {
   makeCursorRuntimeEnv as buildCursorRuntimeEnv,
 } from "./app/auth/cursor-local";
 import { loadCodexAuth as loadCodexAuthFromFile, decodeJwtPayload, extractAccountId } from "./app/auth/codex-oauth";
-import { BUILTIN_MODELS, normalizeModelEntry, normalizeModelList } from "./app/models/registry";
+import { BUILTIN_MODELS, normalizeModelEntry, normalizeModelList, type ModelEntry } from "./app/models/registry";
 import {
   normalizeModelId,
   normalizeRequestBody,
@@ -99,6 +104,7 @@ import {
   listStoredSecrets,
   secretDoctorEntry,
   SecretName,
+  type SecretNameValue,
 } from "./secrets";
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -108,14 +114,145 @@ const CLI_NAME = "sub-bridge";
 const CONFIG_VERSION = 1;
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/alexzhang1030/sub-bridge/main/schemas/config.schema.json";
 
-function envValue(...keys) {
+type ResponseOutputItem = Record<string, unknown>;
+type MessageContentPart = { type: string; text?: string; annotations?: unknown[] };
+type ReasoningSummaryPart = { type: string; text?: string };
+type PiStreamEvent = Record<string, unknown>;
+type PiModelRecord = Record<string, unknown> & { id: string };
+type PiRuntime = {
+  provider: { stream: (...args: unknown[]) => AsyncIterable<PiStreamEvent> };
+  models: Map<string, PiModelRecord>;
+};
+type PiOpenItem = {
+  item: ResponseOutputItem;
+  text?: string;
+  args?: string;
+  kind: string;
+  outputIndex?: number;
+};
+type CursorStreamAssistantEntry = {
+  item: ResponseOutputItem & { content: MessageContentPart[]; status?: string; id?: string };
+  part: MessageContentPart;
+  outputIndex: number;
+  text: string;
+};
+type CursorStreamReasoningEntry = {
+  item: ResponseOutputItem & { summary: ReasoningSummaryPart[]; status?: string; id?: string };
+  part: ReasoningSummaryPart;
+  outputIndex: number;
+  text: string;
+};
+type CursorToolEntry = {
+  toolCall: Record<string, unknown>;
+  item: ResponseOutputItem;
+  outputIndex: number;
+  terminalReported: boolean;
+};
+type FetchJsonResult = {
+  ok: boolean;
+  status: number | null;
+  body: unknown;
+  error?: string;
+};
+
+type ConfigDocument = {
+  $schema: string;
+  version: number;
+  subscriptions: Record<string, SubscriptionConfig>;
+};
+
+type CodexAuthFile = {
+  tokens?: {
+    access_token?: string;
+    refresh_token?: string;
+    account_id?: string;
+  };
+};
+
+type CopilotDoctorDetails = {
+  dbPath: string;
+  exists: boolean;
+  sqlite3: {
+    available: boolean;
+    ok: boolean;
+    status: number | null;
+    stdout: string;
+    stderr: string;
+    error: string | null;
+  };
+  providerId: string;
+  extension: {
+    name: string;
+    dir: string;
+    entry: string;
+    exists: boolean;
+  };
+  provider: { id: string; name: string; baseUrl: string; wireApi: string } | null;
+  modelCount: number | null;
+  error: string | null;
+};
+
+function usageRecord(value: unknown): Record<string, number> | null | undefined {
+  if (value == null) return value as null | undefined;
+  return isPlainObject(value) ? (value as Record<string, number>) : null;
+}
+
+function configString(key: string, envKeys: string[], fallback: string): string {
+  return configValue(key, envKeys, fallback) ?? fallback;
+}
+
+function piIndex(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : Number(value);
+}
+
+function piString(value: unknown): string {
+  return typeof value === "string" ? value : String(value ?? "");
+}
+
+function piPayloadReasoningEffort(payload: Record<string, unknown>): string | null {
+  const reasoning = payload.reasoning;
+  if (!isPlainObject(reasoning)) return null;
+  return typeof reasoning.effort === "string" ? reasoning.effort : null;
+}
+
+function bodyReasoningEffort(body: Record<string, unknown>, modelId: string): string {
+  const reasoning = body.reasoning;
+  if (isPlainObject(reasoning) && typeof reasoning.effort === "string") return reasoning.effort;
+  return reasoningEffortForModel(modelId) ?? REASONING_EFFORT;
+}
+
+function bodyTextVerbosity(body: Record<string, unknown>): string {
+  const text = body.text;
+  if (isPlainObject(text) && typeof text.verbosity === "string") return text.verbosity;
+  return "low";
+}
+
+function modelConfigForAcp(modelId: string): { cursorModel?: string } | null {
+  const config = modelConfigFor(modelId);
+  if (!config) return null;
+  const cursorModel = (config as ModelEntry).cursorModel;
+  return cursorModel !== undefined ? { cursorModel } : {};
+}
+
+function isSecretNameValue(name: string): name is SecretNameValue {
+  return (Object.values(SecretName) as string[]).includes(name);
+}
+
+function piContentPart(item: ResponseOutputItem, index = 0): Record<string, unknown> | undefined {
+  const content = item.content;
+  if (!Array.isArray(content)) return undefined;
+  const part = content[index];
+  return isPlainObject(part) ? part : undefined;
+}
+
+function envValue(...keys: string[]): string | undefined {
   for (const key of keys) {
     if (process.env[key] !== undefined) return process.env[key];
   }
   return undefined;
 }
 
-function parseGlobalArgs(argv) {
+function parseGlobalArgs(argv: string[]) {
   let sub = envValue("SUB_BRIDGE_SUB") || "";
   const args = [];
   for (let index = 0; index < argv.length; index += 1) {
@@ -139,7 +276,7 @@ function parseGlobalArgs(argv) {
 const GLOBAL_ARGS = parseGlobalArgs(process.argv.slice(2));
 const SUB_NAME = GLOBAL_ARGS.sub;
 
-function slug(value) {
+function slug(value: unknown): string {
   return String(value || "")
     .trim()
     .toLowerCase()
@@ -147,12 +284,12 @@ function slug(value) {
     .replace(/^-+|-+$/g, "");
 }
 
-function subEnvKey(suffix) {
+function subEnvKey(suffix: string): string {
   const name = slug(SUB_NAME).replace(/-/g, "_").toUpperCase();
   return name ? `SUB_BRIDGE_${name}_${suffix}` : "";
 }
 
-function envKeysForSub(suffix, fallbackKeys = []) {
+function envKeysForSub(suffix: string, fallbackKeys: string[] = []): string[] {
   return [subEnvKey(suffix), ...fallbackKeys].filter(Boolean);
 }
 
@@ -160,19 +297,19 @@ const CODEX_TOKEN_URL = resolveCodexTokenUrl(
   envKeysForSub("CODEX_TOKEN_URL", ["SUB_BRIDGE_CODEX_TOKEN_URL", "CODEX_TOKEN_URL"]),
 );
 
-function defaultTypeForSub(subName) {
+function defaultTypeForSub(subName: string): string {
   return defaultProviderTypeForSub(subName);
 }
 
-function defaultPortForSub(subName, type) {
+function defaultPortForSub(subName: string, type: string): number {
   return defaultProviderPort(subName, type);
 }
 
-function defaultProviderId(subName, type) {
+function defaultProviderId(subName: string, type: string): string {
   return defaultPluginProviderId(subName, type);
 }
 
-function defaultProviderName(subName, type) {
+function defaultProviderName(subName: string, type: string): string {
   return defaultPluginProviderName(subName, type);
 }
 
@@ -189,10 +326,10 @@ const SUBSCRIPTION_CONFIG_KEYS = new Set([
 const CONFIG_PATH =
   envValue("SUB_BRIDGE_CONFIG", "CODEXSUB_CONFIG") || join(homedir(), ".config", "sub-bridge", "config.json");
 
-function readConfigFile(path = CONFIG_PATH) {
+function readConfigFile(path: string = CONFIG_PATH): ConfigFile {
   if (!existsSync(path)) return {};
-  const parsed = JSON.parse(readFileSync(path, "utf8"));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!isPlainObject(parsed)) {
     throw new Error(`Config file must contain a JSON object: ${path}`);
   }
   return parsed;
@@ -200,22 +337,20 @@ function readConfigFile(path = CONFIG_PATH) {
 
 const CONFIG_FILE = readConfigFile();
 
-function isPlainObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
-
-function normalizeSubscriptionConfig(subscription) {
-  const next = {};
+function normalizeSubscriptionConfig(subscription: unknown): SubscriptionConfig {
+  const next: SubscriptionConfig = {};
   if (!isPlainObject(subscription)) return next;
   for (const key of SUBSCRIPTION_CONFIG_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(subscription, key)) next[key] = subscription[key];
+    if (Object.prototype.hasOwnProperty.call(subscription, key)) {
+      (next as Record<string, unknown>)[key] = subscription[key];
+    }
   }
   return next;
 }
 
-function subscriptionsFromConfig(configFile) {
+function subscriptionsFromConfig(configFile: ConfigFile): Record<string, SubscriptionConfig> {
   const source = isPlainObject(configFile?.subscriptions) ? configFile.subscriptions : {};
-  const subscriptions = {};
+  const subscriptions: Record<string, SubscriptionConfig> = {};
   for (const [name, subscription] of Object.entries(source)) {
     if (!isPlainObject(subscription)) continue;
     subscriptions[name] = normalizeSubscriptionConfig(subscription);
@@ -223,7 +358,7 @@ function subscriptionsFromConfig(configFile) {
   return subscriptions;
 }
 
-function configDocument(subscriptions = subscriptionsFromConfig(CONFIG_FILE)) {
+function configDocument(subscriptions: Record<string, SubscriptionConfig> = subscriptionsFromConfig(CONFIG_FILE)) {
   return {
     $schema: CONFIG_SCHEMA_URL,
     version: CONFIG_VERSION,
@@ -231,7 +366,7 @@ function configDocument(subscriptions = subscriptionsFromConfig(CONFIG_FILE)) {
   };
 }
 
-function activeConfig(configFile, subName) {
+function activeConfig(configFile: ConfigFile, subName: string): SubscriptionConfig {
   if (!subName) return {};
   const subscription = subscriptionsFromConfig(configFile)[subName];
   return normalizeSubscriptionConfig(subscription);
@@ -239,62 +374,61 @@ function activeConfig(configFile, subName) {
 
 const CONFIG = activeConfig(CONFIG_FILE, SUB_NAME);
 
-function configValue(key, envKeys, fallback) {
+function configValue(key: string, envKeys: string[], fallback?: string): string | undefined {
   const env = envValue(...envKeys);
   if (env !== undefined) return env;
-  if (CONFIG[key] !== undefined) return CONFIG[key];
+  const configValueEntry = (CONFIG as Record<string, unknown>)[key];
+  if (configValueEntry !== undefined) return String(configValueEntry);
   return fallback;
 }
 
-function configNumber(key, envKeys, fallback) {
-  const value = configValue(key, envKeys, fallback);
+function configNumber(key: string, envKeys: string[], fallback: number): number {
+  const value = configValue(key, envKeys, String(fallback));
   const number = Number(value);
   if (!Number.isFinite(number)) throw new Error(`Invalid numeric config value for ${key}: ${value}`);
   return number;
 }
 
-function configBoolean(key, envKeys, fallback) {
+function configBoolean(key: string, envKeys: string[], fallback: string): boolean {
   const value = configValue(key, envKeys, fallback);
   const normalized = String(value).toLowerCase();
   return !["0", "false", "no", "off"].includes(normalized);
 }
 
-const BACKEND = configValue("type", envKeysForSub("TYPE", ["SUB_BRIDGE_TYPE"]), defaultTypeForSub(SUB_NAME));
+const BACKEND = configString("type", envKeysForSub("TYPE", ["SUB_BRIDGE_TYPE"]), defaultTypeForSub(SUB_NAME));
 const PROVIDER_PLUGIN = providerPluginForType(BACKEND);
-const AUTH_PATH =
-  configValue(
-    "authPath",
-    envKeysForSub("AUTH_PATH", ["SUB_BRIDGE_AUTH_PATH", "CODEXSUB_AUTH_PATH"]),
-    join(homedir(), ".codex", "auth.json"),
-  );
-const COPILOT_DB =
-  configValue(
-    "copilotDb",
-    envKeysForSub("COPILOT_DB", ["SUB_BRIDGE_COPILOT_DB", "CODEXSUB_COPILOT_DB"]),
-    join(homedir(), ".copilot", "data.db"),
-  );
+const AUTH_PATH = configString(
+  "authPath",
+  envKeysForSub("AUTH_PATH", ["SUB_BRIDGE_AUTH_PATH", "CODEXSUB_AUTH_PATH"]),
+  join(homedir(), ".codex", "auth.json"),
+);
+const COPILOT_DB = configString(
+  "copilotDb",
+  envKeysForSub("COPILOT_DB", ["SUB_BRIDGE_COPILOT_DB", "CODEXSUB_COPILOT_DB"]),
+  join(homedir(), ".copilot", "data.db"),
+);
 const COPILOT_EXTENSION_NAME = "sub-bridge-tools";
 const COPILOT_EXTENSION_DIR =
   envValue("SUB_BRIDGE_COPILOT_EXTENSION_DIR") ||
   join(homedir(), ".copilot", "extensions", COPILOT_EXTENSION_NAME);
-const HOST = configValue("host", envKeysForSub("HOST", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"]), "127.0.0.1");
+const HOST = configString("host", envKeysForSub("HOST", ["SUB_BRIDGE_HOST", "CODEXSUB_HOST"]), "127.0.0.1");
 const PORT = configNumber(
   "port",
   envKeysForSub("PORT", ["SUB_BRIDGE_PORT", "CODEXSUB_PORT"]),
   defaultPortForSub(SUB_NAME, BACKEND),
 );
 const DEFAULT_MODEL_OVERRIDE = envValue(...envKeysForSub("MODEL", ["SUB_BRIDGE_MODEL", "CODEXSUB_MODEL"]));
-const ORIGINATOR = configValue(
+const ORIGINATOR = configString(
   "originator",
   envKeysForSub("ORIGINATOR", ["SUB_BRIDGE_ORIGINATOR", "CODEXSUB_ORIGINATOR"]),
   "pi",
 );
-const PROVIDER_ID = configValue(
+const PROVIDER_ID = configString(
   "providerId",
   envKeysForSub("PROVIDER_ID", ["SUB_BRIDGE_PROVIDER_ID", "CODEXSUB_PROVIDER_ID"]),
   defaultProviderId(SUB_NAME, BACKEND),
 );
-const PROVIDER_NAME = configValue(
+const PROVIDER_NAME = configString(
   "providerName",
   envKeysForSub("PROVIDER_NAME", ["SUB_BRIDGE_PROVIDER_NAME", "CODEXSUB_PROVIDER_NAME"]),
   defaultProviderName(SUB_NAME, BACKEND),
@@ -302,20 +436,19 @@ const PROVIDER_NAME = configValue(
 const LEGACY_STATE_DIR = join(homedir(), ".local", "state", "gpt-sub-bridge");
 const DEFAULT_STATE_DIR = join(homedir(), ".local", "state", "sub-bridge-cli");
 const USE_LEGACY_STATE = existsSync(join(LEGACY_STATE_DIR, "gpt-sub-bridge.pid"));
-const STATE_DIR =
-  configValue(
-    "stateDir",
-    envKeysForSub("STATE_DIR", ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"]),
-    SUB_NAME ? join(DEFAULT_STATE_DIR, slug(SUB_NAME)) : USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR,
-  );
+const STATE_DIR = configString(
+  "stateDir",
+  envKeysForSub("STATE_DIR", ["SUB_BRIDGE_STATE_DIR", "CODEXSUB_STATE_DIR"]),
+  SUB_NAME ? join(DEFAULT_STATE_DIR, slug(SUB_NAME)) : USE_LEGACY_STATE ? LEGACY_STATE_DIR : DEFAULT_STATE_DIR,
+);
 const PID_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.pid" : "sub-bridge.pid";
 const LOG_FILE_NAME = USE_LEGACY_STATE && STATE_DIR === LEGACY_STATE_DIR ? "gpt-sub-bridge.log" : "sub-bridge.log";
-const PID_PATH = configValue(
+const PID_PATH = configString(
   "pidPath",
   envKeysForSub("PID_PATH", ["SUB_BRIDGE_PID_PATH", "CODEXSUB_PID_PATH"]),
   join(STATE_DIR, PID_FILE_NAME),
 );
-const LOG_PATH = configValue(
+const LOG_PATH = configString(
   "logPath",
   envKeysForSub("LOG_PATH", ["SUB_BRIDGE_LOG_PATH", "CODEXSUB_LOG_PATH"]),
   join(STATE_DIR, LOG_FILE_NAME),
@@ -328,13 +461,12 @@ const REASONING_EFFORT =
   ])) || "xhigh";
 const USE_PI_WRAPPER = configBoolean("usePi", ["SUB_BRIDGE_USE_PI", "GPT_SUB_BRIDGE_USE_PI", "CODEXSUB_USE_PI"], "1");
 const LEGACY_PI_RUNTIME_DIR = join(homedir(), ".local", "share", "gpt-sub-bridge");
-const PI_RUNTIME_DIR =
-  configValue(
-    "piDir",
-    ["SUB_BRIDGE_PI_DIR", "GPT_SUB_BRIDGE_PI_DIR"],
-    existsSync(LEGACY_PI_RUNTIME_DIR) ? LEGACY_PI_RUNTIME_DIR : join(homedir(), ".local", "share", "sub-bridge-cli"),
-  );
-const PI_TRANSPORT = configValue("piTransport", ["SUB_BRIDGE_PI_TRANSPORT", "GPT_SUB_BRIDGE_PI_TRANSPORT"], "auto");
+const PI_RUNTIME_DIR = configString(
+  "piDir",
+  ["SUB_BRIDGE_PI_DIR", "GPT_SUB_BRIDGE_PI_DIR"],
+  existsSync(LEGACY_PI_RUNTIME_DIR) ? LEGACY_PI_RUNTIME_DIR : join(homedir(), ".local", "share", "sub-bridge-cli"),
+);
+const PI_TRANSPORT = configString("piTransport", ["SUB_BRIDGE_PI_TRANSPORT", "GPT_SUB_BRIDGE_PI_TRANSPORT"], "auto");
 const PI_TIMEOUT_MS = configNumber("timeoutMs", ["SUB_BRIDGE_TIMEOUT_MS", "GPT_SUB_BRIDGE_TIMEOUT_MS"], 600000);
 const STRIP_COPILOT_TOOLS = configBoolean(
   "stripTools",
@@ -353,7 +485,7 @@ const COPILOT_SSE_DATA_ONLY = configBoolean(
 );
 const BASE_URL = `http://${HOST}:${PORT}/v1`;
 const HEALTH_URL = `http://${HOST}:${PORT}/healthz`;
-const CURSOR_ACP_COMMAND = configValue(
+const CURSOR_ACP_COMMAND = configString(
   "cursorAcpCommand",
   envKeysForSub("CURSOR_ACP_COMMAND", ["SUB_BRIDGE_CURSOR_ACP_COMMAND"]),
   defaultCursorAcpCommand(),
@@ -363,12 +495,12 @@ const CURSOR_API_ENDPOINT = configValue(
   envKeysForSub("CURSOR_API_ENDPOINT", ["SUB_BRIDGE_CURSOR_API_ENDPOINT"]),
   "",
 );
-const CURSOR_WORKSPACE = configValue(
+const CURSOR_WORKSPACE = configString(
   "cursorWorkspace",
   envKeysForSub("CURSOR_WORKSPACE", ["SUB_BRIDGE_CURSOR_WORKSPACE"]),
   process.cwd(),
 );
-const CURSOR_MODEL = configValue("cursorModel", envKeysForSub("CURSOR_MODEL", ["SUB_BRIDGE_CURSOR_MODEL"]), "request");
+const CURSOR_MODEL = configString("cursorModel", envKeysForSub("CURSOR_MODEL", ["SUB_BRIDGE_CURSOR_MODEL"]), "request");
 const CURSOR_ACP_TIMEOUT_MS = configNumber(
   "cursorAcpTimeoutMs",
   envKeysForSub("CURSOR_ACP_TIMEOUT_MS", ["SUB_BRIDGE_CURSOR_ACP_TIMEOUT_MS"]),
@@ -392,9 +524,9 @@ const BRIDGE_KEY = resolveSecret(
   SecretName.BRIDGE_KEY,
   envKeysForSub("KEY", ["SUB_BRIDGE_KEY", "CODEXSUB_BRIDGE_KEY"]),
 ).value;
-let piRuntimePromise = null;
+let piRuntimePromise: Promise<PiRuntime> | null = null;
 
-function logLine(message, fields = {}) {
+function logLine(message: string, fields: Record<string, unknown> = {}): void {
   const suffix = Object.keys(fields).length > 0 ? ` ${JSON.stringify(fields)}` : "";
   console.log(`${new Date().toISOString()} ${message}${suffix}`);
 }
@@ -426,7 +558,7 @@ function defaultModelFromModels() {
 
 const DEFAULT_MODEL = defaultModelFromModels();
 
-function modelConfigFor(modelId) {
+function modelConfigFor(modelId: string) {
   const normalized = normalizeModelId(modelId, DEFAULT_MODEL);
   const base = stripCursorParameterizedSuffix(normalized);
   return (
@@ -436,15 +568,24 @@ function modelConfigFor(modelId) {
   );
 }
 
-function reasoningEffortForModel(modelId) {
+function reasoningEffortForModel(modelId: string) {
   return resolveReasoningEffortForModel(modelConfigFor(modelId), REASONING_EFFORT);
 }
 
-function cursorOptionsForModel(modelId, body) {
+function cursorOptionsForModel(modelId: string, body: Record<string, unknown>) {
   const modelConfig = modelConfigFor(modelId);
   const effort = reasoningEffortForModel(modelId);
   const resolvedReasoning = effort ? { reasoningEffort: effort } : null;
   return mergeCursorModelOptions(cursorOptionsFromModelEntry(modelConfig), resolvedReasoning);
+}
+
+function acpModelOptions(modelId: string, body: Record<string, unknown>): Record<string, unknown> | undefined {
+  const options = cursorOptionsForModel(modelId, body);
+  return options ? { ...options } : undefined;
+}
+
+function requestModelFromBody(body: Record<string, unknown>): string {
+  return typeof body.model === "string" ? body.model : DEFAULT_MODEL;
 }
 
 function usage(exitCode = 0) {
@@ -553,7 +694,10 @@ async function loadCodexAuth({ forceRefresh = false } = {}) {
   });
 }
 
-function normalizeRequestBodyForBridge(bodyText, { stripTools = STRIP_COPILOT_TOOLS, req = null } = {}) {
+function normalizeRequestBodyForBridge(
+  bodyText: string,
+  { stripTools = STRIP_COPILOT_TOOLS, req = null }: { stripTools?: boolean; req?: IncomingMessage | null } = {},
+) {
   return normalizeRequestBody(bodyText, {
     stripTools,
     req,
@@ -562,7 +706,7 @@ function normalizeRequestBodyForBridge(bodyText, { stripTools = STRIP_COPILOT_TO
   });
 }
 
-async function loadPiRuntime() {
+async function loadPiRuntime(): Promise<PiRuntime> {
   if (!piRuntimePromise) {
     piRuntimePromise = (async () => {
       const providerPath = join(
@@ -574,7 +718,9 @@ async function loadPiRuntime() {
         "providers",
         "openai-codex.js",
       );
-      const mod = await import(pathToFileURL(providerPath).href);
+      const mod = (await import(pathToFileURL(providerPath).href)) as {
+        openaiCodexProvider: () => PiRuntime["provider"] & { getModels: () => PiModelRecord[] };
+      };
       const provider = mod.openaiCodexProvider();
       const models = new Map(provider.getModels().map((model) => [model.id, model]));
       return { provider, models };
@@ -594,46 +740,49 @@ function emptyUsage() {
   };
 }
 
-function parseJsonObject(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+function parseJsonObject(value: unknown): Record<string, unknown> {
+  if (isPlainObject(value)) return value;
   if (typeof value !== "string" || !value.trim()) return {};
   try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    const parsed = JSON.parse(value) as unknown;
+    return isPlainObject(parsed) ? parsed : {};
   } catch {
     return {};
   }
 }
 
-function textFromResponsesContent(content) {
+function textFromResponsesContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
-  const parts = [];
+  const parts: string[] = [];
   for (const item of content) {
+    const entry = item as Record<string, unknown>;
     if (typeof item === "string") {
       parts.push(item);
-    } else if (item?.type === "input_text" || item?.type === "output_text" || item?.type === "text") {
-      if (typeof item.text === "string") parts.push(item.text);
-    } else if (item?.type === "refusal" && typeof item.refusal === "string") {
-      parts.push(item.refusal);
+    } else if (entry?.type === "input_text" || entry?.type === "output_text" || entry?.type === "text") {
+      if (typeof entry.text === "string") parts.push(entry.text);
+    } else if (entry?.type === "refusal" && typeof entry.refusal === "string") {
+      parts.push(entry.refusal);
     }
   }
   return parts.join("");
 }
 
-function imageFromResponsesPart(part) {
-  if (!part || part.type !== "input_image") return null;
-  const imageUrl = part.image_url?.url || part.image_url;
+function imageFromResponsesPart(part: unknown): { type: "image"; mimeType: string; data: string } | null {
+  const record = isPlainObject(part) ? part : null;
+  if (!record || record.type !== "input_image") return null;
+  const imageUrlRecord = isPlainObject(record.image_url) ? record.image_url : null;
+  const imageUrl = imageUrlRecord?.url ?? record.image_url;
   if (typeof imageUrl !== "string") return null;
   const match = /^data:([^;,]+);base64,(.+)$/i.exec(imageUrl);
   if (!match) return null;
   return { type: "image", mimeType: match[1], data: match[2] };
 }
 
-function userContentFromResponsesContent(content) {
+function userContentFromResponsesContent(content: unknown): string | Array<{ type: string; text?: string; mimeType?: string; data?: string }> {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
-  const blocks = [];
+  const blocks: Array<{ type: string; text?: string; mimeType?: string; data?: string }> = [];
   for (const item of content) {
     if (typeof item === "string") {
       blocks.push({ type: "text", text: item });
@@ -642,40 +791,44 @@ function userContentFromResponsesContent(content) {
     const image = imageFromResponsesPart(item);
     if (image) {
       blocks.push(image);
-    } else if (item?.type === "input_text" || item?.type === "text") {
-      if (typeof item.text === "string") blocks.push({ type: "text", text: item.text });
+    } else if (isPlainObject(item)) {
+      if (item.type === "input_text" || item.type === "text") {
+        if (typeof item.text === "string") blocks.push({ type: "text", text: item.text });
+      }
     }
   }
   if (blocks.length === 0) return "";
-  if (blocks.every((block) => block.type === "text")) return blocks.map((block) => block.text).join("");
+  if (blocks.every((block) => block.type === "text")) {
+    return blocks.map((block) => block.text ?? "").join("");
+  }
   return blocks;
 }
 
-function convertResponsesToolsToPi(tools) {
+function convertResponsesToolsToPi(tools: unknown) {
   if (!Array.isArray(tools)) return [];
-  const converted = [];
+  const converted: Array<{ name: string; description: string; parameters: Record<string, unknown> }> = [];
   for (const tool of tools) {
-    const source = tool?.function && typeof tool.function === "object" ? tool.function : tool;
+    const toolRecord = isPlainObject(tool) ? tool : null;
+    const source = isPlainObject(toolRecord?.function) ? toolRecord.function : toolRecord;
     const name = source?.name;
-    if (tool?.type && tool.type !== "function") continue;
+    if (toolRecord?.type && toolRecord.type !== "function") continue;
     if (typeof name !== "string" || !name) continue;
     converted.push({
       name,
       description: typeof source.description === "string" ? source.description : "",
-      parameters:
-        source.parameters && typeof source.parameters === "object"
-          ? source.parameters
-          : { type: "object", properties: {}, additionalProperties: false },
+      parameters: isPlainObject(source?.parameters)
+        ? source.parameters
+        : { type: "object", properties: {}, additionalProperties: false },
     });
   }
   return converted;
 }
 
-function responsesBodyToPiContext(body) {
-  const model = normalizeModelId(body.model, DEFAULT_MODEL);
-  const messages = [];
-  const systemParts = [];
-  const toolNamesByCallId = new Map();
+function responsesBodyToPiContext(body: Record<string, unknown>) {
+  const model = normalizeModelId(String(body.model ?? ""), DEFAULT_MODEL);
+  const messages: Array<Record<string, unknown>> = [];
+  const systemParts: string[] = [];
+  const toolNamesByCallId = new Map<string, string>();
 
   if (typeof body.instructions === "string" && body.instructions) {
     systemParts.push(body.instructions);
@@ -683,7 +836,7 @@ function responsesBodyToPiContext(body) {
 
   const input = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input;
   for (const item of Array.isArray(input) ? input : []) {
-    if (!item || typeof item !== "object") continue;
+    if (!isPlainObject(item)) continue;
 
     const role = item.role;
     const type = item.type;
@@ -744,7 +897,7 @@ function responsesBodyToPiContext(body) {
 
     if (type === "function_call_output") {
       const callId = String(item.call_id || "");
-      const output = textFromResponsesContent(item.output || item.content);
+      const output = textFromResponsesContent(item.output ?? item.content);
       messages.push({
         role: "toolResult",
         toolCallId: callId,
@@ -767,33 +920,48 @@ function responsesBodyToPiContext(body) {
   };
 }
 
-async function collectPiResponse({ provider, model, context, token, sessionId, body, signal }) {
-  const output = [];
-  const openItems = new Map();
-  let finalMessage = null;
+async function collectPiResponse({
+  provider,
+  model,
+  context,
+  token,
+  sessionId,
+  body,
+  signal,
+}: {
+  provider: { stream: (...args: unknown[]) => AsyncIterable<Record<string, unknown>> };
+  model: { id: string };
+  context: Record<string, unknown>;
+  token: string;
+  sessionId: string;
+  body: Record<string, unknown>;
+  signal: AbortSignal;
+}) {
+  const output: ResponseOutputItem[] = [];
+  const openItems = new Map<number, PiOpenItem>();
+  let finalMessage: Record<string, unknown> | null = null;
   let stopReason = "stop";
-  const effectiveReasoningEffort = body.reasoning?.effort || reasoningEffortForModel(model.id);
   const piStream = provider.stream(model, context, {
     apiKey: token,
-    reasoningEffort: effectiveReasoningEffort,
+    reasoningEffort: bodyReasoningEffort(body, model.id),
     reasoningSummary: "auto",
-    textVerbosity: body.text?.verbosity || "low",
+    textVerbosity: bodyTextVerbosity(body),
     sessionId,
     transport: PI_TRANSPORT,
     timeoutMs: PI_TIMEOUT_MS,
     websocketConnectTimeoutMs: 15000,
     maxRetries: 1,
     signal,
-    onPayload: (payload) => {
+    onPayload: (payload: Record<string, unknown>) => {
       logLine("responses.pi_payload", {
         model: model.id,
-        inputItems: Array.isArray(payload?.input) ? payload.input.length : null,
-        toolsOut: Array.isArray(payload?.tools) ? payload.tools.length : 0,
-        reasoningEffort: payload?.reasoning?.effort || null,
+        inputItems: Array.isArray(payload.input) ? payload.input.length : null,
+        toolsOut: Array.isArray(payload.tools) ? payload.tools.length : 0,
+        reasoningEffort: piPayloadReasoningEffort(payload),
         transport: PI_TRANSPORT,
       });
     },
-    onResponse: (response) => {
+    onResponse: (response: { status: number; headers?: Record<string, string> }) => {
       logLine("responses.upstream", {
         status: response.status,
         contentType: response.headers?.["content-type"] || "",
@@ -802,9 +970,12 @@ async function collectPiResponse({ provider, model, context, token, sessionId, b
     },
   });
 
-  for await (const event of piStream) {
+  for await (const rawEvent of piStream) {
+    const event = rawEvent as PiStreamEvent;
+    const contentIndex = piIndex(event.contentIndex);
+
     if (event.type === "text_start") {
-      const item = {
+      const item: ResponseOutputItem = {
         id: `msg_${randomUUID().replace(/-/g, "")}`,
         type: "message",
         status: "in_progress",
@@ -812,91 +983,100 @@ async function collectPiResponse({ provider, model, context, token, sessionId, b
         content: [{ type: "output_text", text: "", annotations: [] }],
       };
       output.push(item);
-      openItems.set(event.contentIndex, { item, text: "", kind: "text" });
+      openItems.set(contentIndex, { item, text: "", kind: "text" });
       continue;
     }
 
     if (event.type === "text_delta") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "text") continue;
-      entry.text += event.delta;
-      entry.item.content[0].text = entry.text;
+      entry.text = `${entry.text ?? ""}${piString(event.delta)}`;
+      const part = piContentPart(entry.item);
+      if (part) part.text = entry.text;
       continue;
     }
 
     if (event.type === "text_end") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "text") continue;
-      entry.text = event.content;
+      entry.text = piString(event.content);
       entry.item.status = "completed";
-      entry.item.content[0].text = event.content;
-      openItems.delete(event.contentIndex);
+      const part = piContentPart(entry.item);
+      if (part) part.text = entry.text;
+      openItems.delete(contentIndex);
       continue;
     }
 
     if (event.type === "toolcall_start") {
-      const block = event.partial?.content?.[event.contentIndex] || {};
+      const partial = isPlainObject(event.partial) ? event.partial : {};
+      const partialContent = Array.isArray(partial.content) ? partial.content : [];
+      const block = isPlainObject(partialContent[contentIndex]) ? partialContent[contentIndex] : {};
       const ids = normalizeToolCallIds({
         id: String(block.id || ""),
         call_id: String(block.id || "").split("|")[0] || undefined,
       });
-      const item = {
+      const item: ResponseOutputItem = {
         id: ids.itemId,
         type: "function_call",
         call_id: ids.callId,
-        name: block.name || "tool",
+        name: typeof block.name === "string" ? block.name : "tool",
         arguments: "",
         status: "in_progress",
       };
       output.push(item);
-      openItems.set(event.contentIndex, { item, args: "", kind: "tool" });
+      openItems.set(contentIndex, { item, args: "", kind: "tool" });
       continue;
     }
 
     if (event.type === "toolcall_delta") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "tool") continue;
-      entry.args += event.delta;
+      entry.args = `${entry.args ?? ""}${piString(event.delta)}`;
       entry.item.arguments = entry.args;
       continue;
     }
 
     if (event.type === "toolcall_end") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "tool") continue;
+      const toolCall = isPlainObject(event.toolCall) ? event.toolCall : {};
+      const toolCallId = typeof toolCall.id === "string" ? toolCall.id : "";
       const ids = normalizeToolCallIds({
-        id: event.toolCall?.id?.split("|")[1] || entry.item.id,
-        call_id: event.toolCall?.id?.split("|")[0] || entry.item.call_id,
+        id: toolCallId.split("|")[1] || String(entry.item.id || ""),
+        call_id: toolCallId.split("|")[0] || String(entry.item.call_id || ""),
       });
       entry.item.id = ids.itemId;
       entry.item.call_id = ids.callId;
-      entry.item.name = event.toolCall?.name || entry.item.name;
-      entry.item.arguments = JSON.stringify(event.toolCall?.arguments || parseJsonObject(entry.args));
+      entry.item.name = typeof toolCall.name === "string" ? toolCall.name : entry.item.name;
+      entry.item.arguments = JSON.stringify(toolCall.arguments ?? parseJsonObject(entry.args));
       entry.item.status = "completed";
-      openItems.delete(event.contentIndex);
+      openItems.delete(contentIndex);
       continue;
     }
 
     if (event.type === "done") {
-      finalMessage = event.message;
-      stopReason = event.reason;
+      finalMessage = isPlainObject(event.message) ? event.message : null;
+      stopReason = piString(event.reason);
       break;
     }
 
     if (event.type === "error") {
-      throw new Error(event.error?.errorMessage || "Pi stream failed");
+      const errorPayload = isPlainObject(event.error) ? event.error : {};
+      const message =
+        typeof errorPayload.errorMessage === "string" ? errorPayload.errorMessage : "Pi stream failed";
+      throw new Error(message);
     }
   }
 
   return {
     output,
-    usage: normalizeResponseUsage(finalMessage?.usage),
+    usage: normalizeResponseUsage(usageRecord(finalMessage?.usage)),
     status: stopReason === "length" ? "incomplete" : "completed",
     stopReason,
   };
 }
 
-function codexHeaders(token, accountId, req) {
+function codexHeaders(token: string, accountId: string, req: IncomingMessage | null) {
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${token}`);
   headers.set("chatgpt-account-id", accountId);
@@ -907,21 +1087,22 @@ function codexHeaders(token, accountId, req) {
   headers.set("content-type", "application/json");
 
   const sessionId =
-    req.headers["session-id"] ||
-    req.headers["x-client-request-id"] ||
-    req.headers["x-request-id"] ||
+    req?.headers["session-id"] ||
+    req?.headers["x-client-request-id"] ||
+    req?.headers["x-request-id"] ||
     randomUUID();
   headers.set("session-id", String(sessionId));
   headers.set("x-client-request-id", String(sessionId));
   return headers;
 }
 
-async function forwardResponsesPi(req, res, bodyText) {
+async function forwardResponsesPi(req: IncomingMessage, res: ServerResponse, bodyText: string) {
   const startedAt = Date.now();
   const normalized = normalizeRequestBodyForBridge(bodyText, { req });
-  const body = JSON.parse(normalized.body);
+  const body = JSON.parse(normalized.body) as Record<string, unknown>;
   const { provider, models } = await loadPiRuntime();
-  const model = models.get(body.model) || models.get(DEFAULT_MODEL);
+  const requestedModel = typeof body.model === "string" ? body.model : DEFAULT_MODEL;
+  const model = models.get(requestedModel) || models.get(DEFAULT_MODEL);
   if (!model) {
     throw new Error(`Pi OpenAI Codex model is not available: ${body.model}`);
   }
@@ -935,8 +1116,8 @@ async function forwardResponsesPi(req, res, bodyText) {
       randomUUID(),
   );
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
-  const output = [];
-  const openItems = new Map();
+  const output: ResponseOutputItem[] = [];
+  const openItems = new Map<number, PiOpenItem>();
   let headerLogged = false;
   const streamStartedAt = Date.now();
   const { recordWrite, getBytes } = createSseRecorder(res, COPILOT_SSE_DATA_ONLY);
@@ -1013,25 +1194,25 @@ async function forwardResponsesPi(req, res, bodyText) {
   try {
     piStream = provider.stream(model, context, {
       apiKey: token,
-      reasoningEffort: body.reasoning?.effort || reasoningEffortForModel(model.id),
+      reasoningEffort: bodyReasoningEffort(body, model.id),
       reasoningSummary: "auto",
-      textVerbosity: body.text?.verbosity || "low",
+      textVerbosity: bodyTextVerbosity(body),
       sessionId,
       transport: PI_TRANSPORT,
       timeoutMs: PI_TIMEOUT_MS,
       websocketConnectTimeoutMs: 15000,
       maxRetries: 1,
       signal: controller.signal,
-      onPayload: (payload) => {
+      onPayload: (payload: Record<string, unknown>) => {
         logLine("responses.pi_payload", {
           model: model.id,
-          inputItems: Array.isArray(payload?.input) ? payload.input.length : null,
-          toolsOut: Array.isArray(payload?.tools) ? payload.tools.length : 0,
-          reasoningEffort: payload?.reasoning?.effort || null,
+          inputItems: Array.isArray(payload.input) ? payload.input.length : null,
+          toolsOut: Array.isArray(payload.tools) ? payload.tools.length : 0,
+          reasoningEffort: piPayloadReasoningEffort(payload),
           transport: PI_TRANSPORT,
         });
       },
-      onResponse: (response) => {
+      onResponse: (response: { status: number; headers?: Record<string, string> }) => {
         headerLogged = true;
         logLine("responses.upstream", {
           status: response.status,
@@ -1042,7 +1223,7 @@ async function forwardResponsesPi(req, res, bodyText) {
         });
       },
     });
-  } catch (error) {
+  } catch (error: unknown) {
     throw error;
   }
 
@@ -1050,7 +1231,8 @@ async function forwardResponsesPi(req, res, bodyText) {
     for (const entry of openItems.values()) {
       if (entry.kind === "text") {
         entry.item.status = "completed";
-        entry.item.content[0].text = entry.text;
+        const part = piContentPart(entry.item);
+        if (part) part.text = entry.text ?? "";
         recordWrite("response.output_text.done", {
           item_id: entry.item.id,
           output_index: entry.outputIndex,
@@ -1061,7 +1243,7 @@ async function forwardResponsesPi(req, res, bodyText) {
           item_id: entry.item.id,
           output_index: entry.outputIndex,
           content_index: 0,
-          part: entry.item.content[0],
+          part: piContentPart(entry.item),
         });
         recordWrite("response.output_item.done", {
           output_index: entry.outputIndex,
@@ -1083,7 +1265,7 @@ async function forwardResponsesPi(req, res, bodyText) {
     openItems.clear();
   };
 
-  const completeCancelledPiStream = (error) => {
+  const completeCancelledPiStream = (error: unknown) => {
     const message = errorMessage(error);
     if (!res.writableEnded && !res.destroyed) {
       finishOpenPiItems();
@@ -1107,7 +1289,7 @@ async function forwardResponsesPi(req, res, bodyText) {
     });
   };
 
-  const failPiStream = (error) => {
+  const failPiStream = (error: unknown) => {
     const message = errorMessage(error) || "Pi stream failed";
     if (!res.writableEnded && !res.destroyed) {
       recordWrite("response.failed", {
@@ -1131,9 +1313,11 @@ async function forwardResponsesPi(req, res, bodyText) {
     });
   };
 
-  let finalMessage = null;
+  let finalMessage: Record<string, unknown> | null = null;
   try {
-    for await (const event of piStream) {
+    for await (const rawEvent of piStream) {
+    const event = rawEvent as PiStreamEvent;
+    const contentIndex = piIndex(event.contentIndex);
     if (!headerLogged && event.type === "start") {
       headerLogged = true;
       logLine("responses.upstream", {
@@ -1148,18 +1332,18 @@ async function forwardResponsesPi(req, res, bodyText) {
     if (event.type === "text_start") {
       const itemId = `msg_${randomUUID().replace(/-/g, "")}`;
       const outputIndex = output.length;
-      const item = {
+      const item: ResponseOutputItem = {
         id: itemId,
         type: "message",
         status: "in_progress",
         role: "assistant",
-        content: [],
+        content: [] as MessageContentPart[],
       };
       output.push(item);
-      openItems.set(event.contentIndex, { outputIndex, item, text: "", kind: "text" });
+      openItems.set(contentIndex, { outputIndex, item, text: "", kind: "text" });
       recordWrite("response.output_item.added", { output_index: outputIndex, item });
-      const part = { type: "output_text", text: "", annotations: [] };
-      item.content.push(part);
+      const part: MessageContentPart = { type: "output_text", text: "", annotations: [] };
+      (item.content as MessageContentPart[]).push(part);
       recordWrite("response.content_part.added", {
         item_id: itemId,
         output_index: outputIndex,
@@ -1170,10 +1354,11 @@ async function forwardResponsesPi(req, res, bodyText) {
     }
 
     if (event.type === "text_delta") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "text") continue;
-      entry.text += event.delta;
-      entry.item.content[0].text = entry.text;
+      entry.text = `${entry.text ?? ""}${piString(event.delta)}`;
+      const part = piContentPart(entry.item);
+      if (part) part.text = entry.text;
       recordWrite("response.output_text.delta", {
         item_id: entry.item.id,
         output_index: entry.outputIndex,
@@ -1184,56 +1369,59 @@ async function forwardResponsesPi(req, res, bodyText) {
     }
 
     if (event.type === "text_end") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "text") continue;
-      entry.text = event.content;
+      entry.text = piString(event.content);
       entry.item.status = "completed";
-      entry.item.content[0].text = event.content;
+      const endPart = piContentPart(entry.item);
+      if (endPart) endPart.text = entry.text;
       recordWrite("response.output_text.done", {
         item_id: entry.item.id,
         output_index: entry.outputIndex,
         content_index: 0,
-        text: event.content,
+        text: entry.text,
       });
       recordWrite("response.content_part.done", {
         item_id: entry.item.id,
         output_index: entry.outputIndex,
         content_index: 0,
-        part: entry.item.content[0],
+        part: piContentPart(entry.item),
       });
       recordWrite("response.output_item.done", {
         output_index: entry.outputIndex,
         item: entry.item,
       });
-      openItems.delete(event.contentIndex);
+      openItems.delete(contentIndex);
       continue;
     }
 
     if (event.type === "toolcall_start") {
-      const block = event.partial?.content?.[event.contentIndex] || {};
+      const partial = isPlainObject(event.partial) ? event.partial : {};
+      const partialContent = Array.isArray(partial.content) ? partial.content : [];
+      const block = isPlainObject(partialContent[contentIndex]) ? partialContent[contentIndex] : {};
       const ids = normalizeToolCallIds({
         id: String(block.id || ""),
         call_id: String(block.id || "").split("|")[0] || undefined,
       });
       const outputIndex = output.length;
-      const item = {
+      const item: ResponseOutputItem = {
         id: ids.itemId,
         type: "function_call",
         call_id: ids.callId,
-        name: block.name || "tool",
+        name: typeof block.name === "string" ? block.name : "tool",
         arguments: "",
         status: "in_progress",
       };
       output.push(item);
-      openItems.set(event.contentIndex, { outputIndex, item, args: "", kind: "tool" });
+      openItems.set(contentIndex, { outputIndex, item, args: "", kind: "tool" });
       recordWrite("response.output_item.added", { output_index: outputIndex, item });
       continue;
     }
 
     if (event.type === "toolcall_delta") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "tool") continue;
-      entry.args += event.delta;
+      entry.args = `${entry.args ?? ""}${piString(event.delta)}`;
       entry.item.arguments = entry.args;
       recordWrite("response.function_call_arguments.delta", {
         item_id: entry.item.id,
@@ -1244,16 +1432,18 @@ async function forwardResponsesPi(req, res, bodyText) {
     }
 
     if (event.type === "toolcall_end") {
-      const entry = openItems.get(event.contentIndex);
+      const entry = openItems.get(contentIndex);
       if (!entry || entry.kind !== "tool") continue;
+      const toolCall = isPlainObject(event.toolCall) ? event.toolCall : {};
+      const toolCallId = typeof toolCall.id === "string" ? toolCall.id : "";
       const ids = normalizeToolCallIds({
-        id: event.toolCall?.id?.split("|")[1] || entry.item.id,
-        call_id: event.toolCall?.id?.split("|")[0] || entry.item.call_id,
+        id: toolCallId.split("|")[1] || String(entry.item.id || ""),
+        call_id: toolCallId.split("|")[0] || String(entry.item.call_id || ""),
       });
-      const args = JSON.stringify(event.toolCall?.arguments || parseJsonObject(entry.args));
+      const args = JSON.stringify(toolCall.arguments ?? parseJsonObject(entry.args));
       entry.item.id = ids.itemId;
       entry.item.call_id = ids.callId;
-      entry.item.name = event.toolCall?.name || entry.item.name;
+      entry.item.name = typeof toolCall.name === "string" ? toolCall.name : entry.item.name;
       entry.item.arguments = args;
       entry.item.status = "completed";
       recordWrite("response.function_call_arguments.done", {
@@ -1265,18 +1455,18 @@ async function forwardResponsesPi(req, res, bodyText) {
         output_index: entry.outputIndex,
         item: entry.item,
       });
-      openItems.delete(event.contentIndex);
+      openItems.delete(contentIndex);
       continue;
     }
 
     if (event.type === "done") {
-      finalMessage = event.message;
-      const usage = normalizeResponseUsage(event.message?.usage);
+      finalMessage = isPlainObject(event.message) ? event.message : null;
+      const usage = normalizeResponseUsage(usageRecord(finalMessage?.usage));
       recordWrite("response.completed", {
         response: responseObject({
           id: responseId,
           model: model.id,
-          status: event.reason === "length" ? "incomplete" : "completed",
+          status: piString(event.reason) === "length" ? "incomplete" : "completed",
           output,
           usage,
         }),
@@ -1296,7 +1486,9 @@ async function forwardResponsesPi(req, res, bodyText) {
     }
 
     if (event.type === "error") {
-      const message = event.error?.errorMessage || "Pi stream failed";
+      const errorPayload = isPlainObject(event.error) ? event.error : {};
+      const message =
+        typeof errorPayload.errorMessage === "string" ? errorPayload.errorMessage : "Pi stream failed";
       if (isAbortLikeError(event.error) || isAbortLikeError(message) || controller.signal.aborted || res.destroyed) {
         completeCancelledPiStream(event.error || message);
         return;
@@ -1307,7 +1499,9 @@ async function forwardResponsesPi(req, res, bodyText) {
           model: model.id,
           status: "failed",
           output,
-          usage: normalizeResponseUsage(event.error?.usage),
+          usage: normalizeResponseUsage(
+            usageRecord(isPlainObject(event.error) ? event.error.usage : null),
+          ),
           error: { message, type: "bridge_error" },
         }),
       });
@@ -1323,7 +1517,7 @@ async function forwardResponsesPi(req, res, bodyText) {
       return;
     }
   }
-  } catch (error) {
+  } catch (error: unknown) {
     if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
       completeCancelledPiStream(error);
       return;
@@ -1356,7 +1550,7 @@ async function forwardResponsesPi(req, res, bodyText) {
   }
 }
 
-async function forwardResponsesRaw(req, res, bodyText, retry = true) {
+async function forwardResponsesRaw(req: IncomingMessage, res: ServerResponse, bodyText: string, retry = true) {
   const startedAt = Date.now();
   const { token, accountId } = await loadCodexAuth();
   const url = `${DEFAULT_CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;
@@ -1383,7 +1577,7 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
 
   if (upstream.status === 401 && retry) {
     await loadCodexAuth({ forceRefresh: true });
-    return forwardResponses(req, res, bodyText, false);
+    return forwardResponsesRaw(req, res, bodyText, false);
   }
 
   const upstreamContentType = upstream.headers.get("content-type") || "";
@@ -1435,7 +1629,7 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
       bytes,
     });
   });
-  upstreamStream.on("error", (error) => {
+  upstreamStream.on("error", (error: unknown) => {
     logLine(isAbortLikeError(error) || res.destroyed ? "responses.cancelled" : "responses.stream_error", {
       status: upstream.status,
       model: normalized.info.model,
@@ -1446,21 +1640,22 @@ async function forwardResponsesRaw(req, res, bodyText, retry = true) {
   upstreamStream.pipe(res);
 }
 
-async function forwardResponsesCursorAcp(req, res, bodyText) {
+async function forwardResponsesCursorAcp(req: IncomingMessage, res: ServerResponse, bodyText: string) {
   const startedAt = Date.now();
   const normalized = normalizeRequestBodyForBridge(bodyText, { stripTools: STRIP_COPILOT_TOOLS, req });
-  const body = JSON.parse(normalized.body);
+  const body = JSON.parse(normalized.body) as Record<string, unknown>;
   const copilotTools = Array.isArray(body.tools) ? body.tools : [];
   const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
-  const output = [];
-  const actualCursorModel = resolveCursorAcpModel(body.model, {
+  const output: ResponseOutputItem[] = [];
+  const requestModel = requestModelFromBody(body);
+  const actualCursorModel = resolveCursorAcpModel(requestModel, {
     cursorModelSetting: CURSOR_MODEL,
-    modelConfigFor,
+    modelConfigFor: modelConfigForAcp,
   });
 
   logLine("responses.forward", {
     path: req.url,
-    model: body.model,
+    model: requestModel,
     cursorModel: actualCursorModel,
     stream: body.stream,
     inputType: normalized.info.inputType,
@@ -1481,16 +1676,16 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     env: makeCursorRuntimeEnv(),
     timeoutMs: CURSOR_ACP_TIMEOUT_MS,
     model: actualCursorModel,
-    reasoningEffort: reasoningEffortForModel(body.model),
-    modelOptions: cursorOptionsForModel(body.model, body),
+    reasoningEffort: reasoningEffortForModel(requestModel),
+    modelOptions: acpModelOptions(requestModel, body),
     body,
     copilotToolNames: allowedCopilotToolNames(copilotTools),
-    onStderr: (chunk) => {
+    onStderr: (chunk: string | Buffer) => {
       const text = String(chunk || "").trim();
       if (text) logLine("cursor.stderr", { text: logPrefix(text, 500) });
     },
-    onProtocolError: (error) => {
-      logLine("cursor.protocol_error", { message: error instanceof Error ? error.message : String(error) });
+    onProtocolError: (error: Error) => {
+      logLine("cursor.protocol_error", { message: error.message });
     },
   };
 
@@ -1504,26 +1699,26 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       appendCursorJsonOutputFromEvents(output, result.events, result.text, { copilotTools, log: logLine });
       json(res, 200, responseObject({
         id: responseId,
-        model: body.model,
+        model: requestModel,
         status: "completed",
         output,
         usage: result.usage,
       }));
       logLine("responses.complete", {
         status: 200,
-        model: body.model,
+        model: requestModel,
         cursorModel: actualCursorModel,
         responseFormat: "json",
         totalMs: Date.now() - startedAt,
         runtime: "cursor-acp",
         stopReason: result.stopReason,
       });
-    } catch (error) {
+    } catch (error: unknown) {
       const message = errorMessage(error);
       if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
         logLine("responses.cancelled", {
           status: 200,
-          model: body.model,
+          model: requestModel,
           cursorModel: actualCursorModel,
           responseFormat: "json",
           totalMs: Date.now() - startedAt,
@@ -1533,7 +1728,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
         if (!res.writableEnded && !res.destroyed) {
           json(res, 200, responseObject({
             id: responseId,
-            model: body.model,
+            model: requestModel,
             status: "completed",
             output,
           }));
@@ -1549,13 +1744,13 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       });
       json(res, 200, responseObject({
         id: responseId,
-        model: body.model,
+        model: requestModel,
         status: "completed",
         output,
       }));
       logLine("responses.stream_error", {
         status: 200,
-        model: body.model,
+        model: requestModel,
         cursorModel: actualCursorModel,
         responseFormat: "json",
         totalMs: Date.now() - startedAt,
@@ -1574,9 +1769,9 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   const { recordWrite, getBytes } = createSseRecorder(res, COPILOT_SSE_DATA_ONLY);
 
   recordWrite("response.created", {
-    response: responseObject({ id: responseId, model: body.model, output }),
+    response: responseObject({ id: responseId, model: requestModel, output }),
   });
-  emitResponseInProgress(recordWrite, responseObject({ id: responseId, model: body.model, output }));
+  emitResponseInProgress(recordWrite, responseObject({ id: responseId, model: requestModel, output }));
   flushResponsesSseStream(res);
 
   const controller = new AbortController();
@@ -1585,11 +1780,11 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   });
 
   let nextOutputIndex = 0;
-  let assistantEntry = null;
-  let reasoningEntry = null;
-  const toolEntries = new Map();
+  let assistantEntry: CursorStreamAssistantEntry | null = null;
+  let reasoningEntry: CursorStreamReasoningEntry | null = null;
+  const toolEntries = new Map<string, CursorToolEntry>();
 
-  const addOutputItem = (item) => {
+  const addOutputItem = (item: ResponseOutputItem) => {
     const outputIndex = nextOutputIndex;
     nextOutputIndex += 1;
     output.push(item);
@@ -1597,9 +1792,9 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     return outputIndex;
   };
 
-  const ensureAssistantEntry = () => {
+  const ensureAssistantEntry = (): CursorStreamAssistantEntry => {
     if (assistantEntry) return assistantEntry;
-    const item = {
+    const item: CursorStreamAssistantEntry["item"] = {
       id: `msg_${randomUUID().replace(/-/g, "")}`,
       type: "message",
       status: "in_progress",
@@ -1607,7 +1802,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       content: [],
     };
     const outputIndex = addOutputItem(item);
-    const part = { type: "output_text", text: "", annotations: [] };
+    const part: MessageContentPart = { type: "output_text", text: "", annotations: [] };
     item.content.push(part);
     recordWrite("response.content_part.added", {
       item_id: item.id,
@@ -1651,8 +1846,8 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     assistantEntry = null;
   };
 
-  const emitAssistantTextItem = (text) => {
-    const item = {
+  const emitAssistantTextItem = (text: string) => {
+    const item: CursorStreamAssistantEntry["item"] = {
       id: `msg_${randomUUID().replace(/-/g, "")}`,
       type: "message",
       status: "in_progress",
@@ -1660,7 +1855,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       content: [],
     };
     const outputIndex = addOutputItem(item);
-    const part = { type: "output_text", text: "", annotations: [] };
+    const part: MessageContentPart = { type: "output_text", text: "", annotations: [] };
     item.content.push(part);
     recordWrite("response.content_part.added", {
       item_id: item.id,
@@ -1691,16 +1886,16 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     recordWrite("response.output_item.done", { output_index: outputIndex, item });
   };
 
-  const ensureReasoningEntry = () => {
+  const ensureReasoningEntry = (): CursorStreamReasoningEntry => {
     if (reasoningEntry) return reasoningEntry;
-    const item = {
+    const item: CursorStreamReasoningEntry["item"] = {
       id: `rs_${randomUUID().replace(/-/g, "")}`,
       type: "reasoning",
       status: "in_progress",
       summary: [],
     };
     const outputIndex = addOutputItem(item);
-    const part = { type: "summary_text", text: "" };
+    const part: ReasoningSummaryPart = { type: "summary_text", text: "" };
     item.summary.push(part);
     recordWrite("response.reasoning_summary_part.added", {
       item_id: item.id,
@@ -1733,7 +1928,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     reasoningEntry = null;
   };
 
-  const appendReasoningText = (text) => {
+  const appendReasoningText = (text: string) => {
     const entry = ensureReasoningEntry();
     entry.text += text;
     entry.part.text = entry.text;
@@ -1745,16 +1940,17 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     });
   };
 
-  const applyToolCallEvent = (eventToolCall) => {
+  const applyToolCallEvent = (eventToolCall: Record<string, unknown>) => {
     finishAssistantEntry();
     const toolCall = eventToolCall;
     logLine("cursor.tool_call", JSON.parse(cursorToolArguments(toolCall)));
-    let entry = toolEntries.get(toolCall.id);
+    const toolCallId = typeof toolCall.id === "string" ? toolCall.id : String(toolCall.id ?? "");
+    let entry = toolEntries.get(toolCallId);
     if (!entry) {
       const item = cursorToolCallToFunctionCallItem(toolCall);
       const outputIndex = addOutputItem(item);
       entry = { toolCall, item, outputIndex, terminalReported: false };
-      toolEntries.set(toolCall.id, entry);
+      toolEntries.set(toolCallId, entry);
       recordWrite("response.function_call_arguments.delta", {
         item_id: item.id,
         output_index: outputIndex,
@@ -1765,7 +1961,8 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       entry.item.name = cursorToolName(toolCall);
       entry.item.arguments = cursorToolArguments(toolCall);
     }
-    if (cursorToolStatusIsTerminal(toolCall.status) && !entry.terminalReported) {
+    const toolStatus = typeof toolCall.status === "string" ? toolCall.status : undefined;
+    if (cursorToolStatusIsTerminal(toolStatus) && !entry.terminalReported) {
       entry.item.status = "completed";
       recordWrite("response.function_call_arguments.done", {
         item_id: entry.item.id,
@@ -1774,7 +1971,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       });
       recordWrite("response.output_item.done", { output_index: entry.outputIndex, item: entry.item });
       entry.terminalReported = true;
-      toolEntries.delete(toolCall.id);
+      toolEntries.delete(toolCallId);
     }
   };
 
@@ -1793,10 +1990,11 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     toolEntries.clear();
   };
 
-  const applyExtensionEvent = (payload, eventType) => {
+  const applyExtensionEvent = (payload: unknown, eventType: string) => {
     finishAssistantEntry();
-    logLine(`cursor.${eventType}`, payload);
-    const item = cursorExtensionPayloadToFunctionCallItem(payload);
+    const payloadRecord = isPlainObject(payload) ? payload : {};
+    logLine(`cursor.${eventType}`, payloadRecord);
+    const item = cursorExtensionPayloadToFunctionCallItem(payloadRecord);
     const outputIndex = addOutputItem(item);
     recordWrite("response.function_call_arguments.delta", {
       item_id: item.id,
@@ -1811,10 +2009,13 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     recordWrite("response.output_item.done", { output_index: outputIndex, item });
   };
 
-  const applyCopilotToolCallEvent = (event) => {
+  const applyCopilotToolCallEvent = (event: AcpProcessorEvent) => {
     finishAssistantEntry();
     logLine("cursor.copilot_tool_call", { name: event.name, arguments: event.arguments });
-    const item = copilotNativeToolCallToFunctionCallItem(event);
+    const item = copilotNativeToolCallToFunctionCallItem({
+      name: typeof event.name === "string" ? event.name : "tool",
+      arguments: event.arguments,
+    });
     const outputIndex = addOutputItem(item);
     recordWrite("response.function_call_arguments.delta", {
       item_id: item.id,
@@ -1829,12 +2030,12 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     recordWrite("response.output_item.done", { output_index: outputIndex, item });
   };
 
-  const applyCursorEvent = (event) => {
+  const applyCursorEvent = (event: AcpProcessorEvent) => {
     if (event.type === "assistant_segment_completed") {
       finishAssistantEntry();
       return;
     }
-    if (event.type === "content_delta" && event.streamKind === "assistant_text") {
+    if (event.type === "content_delta" && event.streamKind === "assistant_text" && typeof event.text === "string") {
       const entry = ensureAssistantEntry();
       entry.text += event.text;
       entry.part.text = entry.text;
@@ -1846,11 +2047,11 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       });
       return;
     }
-    if (event.type === "content_delta" && event.streamKind === "reasoning_text") {
+    if (event.type === "content_delta" && event.streamKind === "reasoning_text" && typeof event.text === "string") {
       appendReasoningText(event.text);
       return;
     }
-    if (event.type === "tool_call") {
+    if (event.type === "tool_call" && isPlainObject(event.toolCall)) {
       applyToolCallEvent(event.toolCall);
       return;
     }
@@ -1876,7 +2077,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
-        model: body.model,
+        model: requestModel,
         status: "completed",
         output,
         usage: result.usage,
@@ -1886,14 +2087,14 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     res.end();
     logLine("responses.complete", {
       status: 200,
-      model: body.model,
+      model: requestModel,
       cursorModel: actualCursorModel,
       totalMs: Date.now() - startedAt,
       bytes: getBytes(),
       runtime: "cursor-acp",
       stopReason: result.stopReason,
     });
-  } catch (error) {
+  } catch (error: unknown) {
     const message = errorMessage(error);
     if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
       if (!res.writableEnded && !res.destroyed) {
@@ -1903,7 +2104,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
         recordWrite("response.completed", {
           response: responseObject({
             id: responseId,
-            model: body.model,
+            model: requestModel,
             status: "completed",
             output,
           }),
@@ -1913,7 +2114,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
       }
       logLine("responses.cancelled", {
         status: 200,
-        model: body.model,
+        model: requestModel,
         cursorModel: actualCursorModel,
         totalMs: Date.now() - startedAt,
         message,
@@ -1928,7 +2129,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     recordWrite("response.completed", {
       response: responseObject({
         id: responseId,
-        model: body.model,
+        model: requestModel,
         status: "completed",
         output,
       }),
@@ -1937,7 +2138,7 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
     res.end();
     logLine("responses.stream_error", {
       status: 200,
-      model: body.model,
+      model: requestModel,
       cursorModel: actualCursorModel,
       totalMs: Date.now() - startedAt,
       message,
@@ -1946,23 +2147,24 @@ async function forwardResponsesCursorAcp(req, res, bodyText) {
   }
 }
 
-async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
+async function forwardChatCompletionsCursorAcp(req: IncomingMessage, res: ServerResponse, bodyText: string) {
   const startedAt = Date.now();
-  const chatBody = JSON.parse(bodyText);
+  const chatBody = JSON.parse(bodyText) as Record<string, unknown>;
   const responsesBody = chatCompletionsBodyToResponsesBody(chatBody);
   const normalized = normalizeRequestBodyForBridge(JSON.stringify(responsesBody), { stripTools: STRIP_COPILOT_TOOLS, req });
-  const body = JSON.parse(normalized.body);
+  const body = JSON.parse(normalized.body) as Record<string, unknown>;
   const copilotTools = Array.isArray(body.tools) ? body.tools : [];
   const completionId = `chatcmpl_${randomUUID().replace(/-/g, "")}`;
-  const output = [];
-  const actualCursorModel = resolveCursorAcpModel(body.model, {
+  const output: ResponseOutputItem[] = [];
+  const requestModel = requestModelFromBody(body);
+  const actualCursorModel = resolveCursorAcpModel(requestModel, {
     cursorModelSetting: CURSOR_MODEL,
-    modelConfigFor,
+    modelConfigFor: modelConfigForAcp,
   });
 
   logLine("completions.forward", {
     path: req.url,
-    model: body.model,
+    model: requestModel,
     cursorModel: actualCursorModel,
     stream: body.stream,
     inputMessages: Array.isArray(chatBody.messages) ? chatBody.messages.length : 0,
@@ -1978,16 +2180,16 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
     env: makeCursorRuntimeEnv(),
     timeoutMs: CURSOR_ACP_TIMEOUT_MS,
     model: actualCursorModel,
-    reasoningEffort: reasoningEffortForModel(body.model),
-    modelOptions: cursorOptionsForModel(body.model, body),
+    reasoningEffort: reasoningEffortForModel(requestModel),
+    modelOptions: acpModelOptions(requestModel, body),
     body,
     copilotToolNames: allowedCopilotToolNames(copilotTools),
-    onStderr: (chunk) => {
+    onStderr: (chunk: string | Buffer) => {
       const text = String(chunk || "").trim();
       if (text) logLine("cursor.stderr", { text: logPrefix(text, 500) });
     },
-    onProtocolError: (error) => {
-      logLine("cursor.protocol_error", { message: error instanceof Error ? error.message : String(error) });
+    onProtocolError: (error: Error) => {
+      logLine("cursor.protocol_error", { message: error.message });
     },
   };
 
@@ -2004,33 +2206,33 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
       const message = chatMessageFromResponsesOutput(output);
       json(res, 200, chatCompletionObject({
         id: completionId,
-        model: body.model,
+        model: requestModel,
         message,
         usage: result.usage,
         finishReason: result.stopReason === "end_turn" ? "stop" : "stop",
       }));
       logLine("completions.complete", {
         status: 200,
-        model: body.model,
+        model: requestModel,
         cursorModel: actualCursorModel,
         responseFormat: "json",
         totalMs: Date.now() - startedAt,
         runtime: "cursor-acp",
         stopReason: result.stopReason,
       });
-    } catch (error) {
+    } catch (error: unknown) {
       const message = errorMessage(error);
       if (isAbortLikeError(error) || controller.signal.aborted || res.destroyed) {
-        logLine("completions.cancelled", { status: 200, model: body.model, totalMs: Date.now() - startedAt, message });
+        logLine("completions.cancelled", { status: 200, model: requestModel, totalMs: Date.now() - startedAt, message });
         return;
       }
       json(res, 200, chatCompletionObject({
         id: completionId,
-        model: body.model,
+        model: requestModel,
         message: { role: "assistant", content: `Cursor ACP error: ${message}` },
         finishReason: "stop",
       }));
-      logLine("completions.error", { status: 200, model: body.model, totalMs: Date.now() - startedAt, message });
+      logLine("completions.error", { status: 200, model: requestModel, totalMs: Date.now() - startedAt, message });
     }
     return;
   }
@@ -2043,14 +2245,14 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
 
   let roleSent = false;
   let toolIndex = 0;
-  const writeChunk = (delta, finishReason = null) => {
-    const choice = { index: 0, delta: delta || {} };
+  const writeChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
+    const choice: { index: number; delta: Record<string, unknown>; finish_reason?: string } = { index: 0, delta: delta || {} };
     if (finishReason) choice.finish_reason = finishReason;
     const payload = formatChatCompletionSseChunk({
       id: completionId,
       object: "chat.completion.chunk",
       created: Math.floor(Date.now() / 1000),
-      model: body.model,
+      model: requestModel,
       choices: [choice],
     });
     const socket = res.socket;
@@ -2059,8 +2261,8 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
     if (typeof socket?.uncork === "function") socket.uncork();
   };
 
-  const applyStreamEvent = (event) => {
-    if (event.type === "content_delta" && event.streamKind === "assistant_text" && event.text) {
+  const applyStreamEvent = (event: AcpProcessorEvent) => {
+    if (event.type === "content_delta" && event.streamKind === "assistant_text" && typeof event.text === "string") {
       if (!roleSent) {
         writeChunk({ role: "assistant", content: "" });
         roleSent = true;
@@ -2068,7 +2270,9 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
       writeChunk({ content: event.text });
       return;
     }
-    if (event.type === "tool_call" && cursorToolStatusIsTerminal(event.toolCall?.status)) {
+    if (event.type === "tool_call" && isPlainObject(event.toolCall) && cursorToolStatusIsTerminal(
+      typeof event.toolCall.status === "string" ? event.toolCall.status : undefined,
+    )) {
       const item = cursorToolCallToFunctionCallItem(event.toolCall);
       writeChunk({
         tool_calls: [{
@@ -2098,14 +2302,14 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
     res.end();
     logLine("completions.complete", {
       status: 200,
-      model: body.model,
+      model: requestModel,
       cursorModel: actualCursorModel,
       responseFormat: "sse",
       totalMs: Date.now() - startedAt,
       runtime: "cursor-acp",
       stopReason: result.stopReason,
     });
-  } catch (error) {
+  } catch (error: unknown) {
     const message = errorMessage(error);
     if (!isAbortLikeError(error) && !controller.signal.aborted && !res.destroyed) {
       writeChunk({ content: `Cursor ACP error: ${message}` });
@@ -2115,14 +2319,14 @@ async function forwardChatCompletionsCursorAcp(req, res, bodyText) {
     }
     logLine(isAbortLikeError(error) ? "completions.cancelled" : "completions.error", {
       status: 200,
-      model: body.model,
+      model: requestModel,
       totalMs: Date.now() - startedAt,
       message,
     });
   }
 }
 
-async function forwardChatCompletions(req, res, bodyText) {
+async function forwardChatCompletions(req: IncomingMessage, res: ServerResponse, bodyText: string) {
   if (BACKEND === "cursor-acp" || BACKEND === "cursor") {
     return forwardChatCompletionsCursorAcp(req, res, bodyText);
   }
@@ -2134,7 +2338,7 @@ async function forwardChatCompletions(req, res, bodyText) {
   });
 }
 
-async function forwardResponses(req, res, bodyText) {
+async function forwardResponses(req: IncomingMessage, res: ServerResponse, bodyText: string) {
   return PROVIDER_PLUGIN.forwardResponses(providerPluginContext(), req, res, bodyText);
 }
 
@@ -2194,7 +2398,7 @@ function startServer() {
       }
 
       json(res, 404, { error: { message: `Unknown route: ${url.pathname}`, type: "not_found" } });
-    } catch (error) {
+    } catch (error: unknown) {
       json(res, 500, { error: { message: error instanceof Error ? error.message : String(error), type: "bridge_error" } });
     }
   });
@@ -2226,7 +2430,7 @@ function readPid() {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
-function isPidRunning(pid) {
+function isPidRunning(pid: number) {
   try {
     process.kill(pid, 0);
     return true;
@@ -2251,7 +2455,7 @@ function requireSubscriptions() {
   return subscriptions;
 }
 
-function runSubscriptionCommand(subscriptionName, commandName) {
+function runSubscriptionCommand(subscriptionName: string, commandName: string) {
   const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, commandName], {
     stdio: "inherit",
     env: process.env,
@@ -2259,7 +2463,7 @@ function runSubscriptionCommand(subscriptionName, commandName) {
   if ((result.status ?? 1) !== 0) process.exitCode = result.status ?? 1;
 }
 
-function runSubscriptionCommandJson(subscriptionName, commandName) {
+function runSubscriptionCommandJson(subscriptionName: string, commandName: string) {
   const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, commandName], {
     encoding: "utf8",
     env: process.env,
@@ -2283,7 +2487,7 @@ function runSubscriptionCommandJson(subscriptionName, commandName) {
   }
 }
 
-async function fetchJson(url) {
+async function fetchJson(url: string): Promise<FetchJsonResult> {
   const response = await fetch(url);
   const text = await response.text();
   let body = null;
@@ -2297,7 +2501,7 @@ async function fetchJson(url) {
 
 async function statusCommand() {
   if (!SUB_NAME) {
-    const statuses = {};
+    const statuses: Record<string, unknown> = {};
     for (const subscription of requireSubscriptions()) {
       statuses[subscription] = runSubscriptionCommandJson(subscription, "status");
     }
@@ -2330,7 +2534,11 @@ async function statusCommand() {
   }, null, 2));
 }
 
-function runProbe(command, args = [], options = {}) {
+function runProbe(
+  command: string,
+  args: string[] = [],
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     timeout: options.timeoutMs || 3000,
@@ -2345,7 +2553,11 @@ function runProbe(command, args = [], options = {}) {
   };
 }
 
-function commandProbe(command, args = ["--version"], options = {}) {
+function commandProbe(
+  command: string,
+  args: string[] = ["--version"],
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+) {
   const result = runProbe(command, args, options);
   return {
     available: !result.error,
@@ -2357,7 +2569,7 @@ function commandProbe(command, args = ["--version"], options = {}) {
   };
 }
 
-function providerPluginContext() {
+function providerPluginContext(): ProviderPluginContext {
   return {
     backend: BACKEND,
     providerName: PROVIDER_NAME,
@@ -2379,7 +2591,7 @@ function providerPluginContext() {
     loginCodex,
     logoutCursor,
     logoutCodex,
-    fetchCursorModelSnapshot,
+    fetchCursorModelSnapshot: () => fetchCursorModelSnapshot(),
     fetchCodexModelSnapshot,
     forwardResponsesCursorAcp,
     forwardResponsesPi,
@@ -2388,7 +2600,16 @@ function providerPluginContext() {
 }
 
 function codexAuthDoctor() {
-  const details = {
+  const details: {
+    path: string;
+    exists: boolean;
+    accessTokenPresent: boolean;
+    refreshTokenPresent: boolean;
+    accountIdPresent: boolean;
+    expiresAt: string | null;
+    expiresInSeconds: number | null;
+    error: string | null;
+  } = {
     path: AUTH_PATH,
     exists: existsSync(AUTH_PATH),
     accessTokenPresent: false,
@@ -2400,20 +2621,20 @@ function codexAuthDoctor() {
   };
   if (!details.exists) return details;
   try {
-    const auth = readJson(AUTH_PATH);
+    const auth = readJson<CodexAuthFile>(AUTH_PATH);
     const accessToken = auth?.tokens?.access_token;
     const refreshToken = auth?.tokens?.refresh_token;
     details.accessTokenPresent = typeof accessToken === "string" && accessToken.length > 0;
     details.refreshTokenPresent = typeof refreshToken === "string" && refreshToken.length > 0;
     try {
-      details.accountIdPresent = Boolean(details.accessTokenPresent && extractAccountId(accessToken, auth));
+      details.accountIdPresent = Boolean(details.accessTokenPresent && accessToken && extractAccountId(accessToken, auth));
     } catch {}
-    const payload = decodeJwtPayload(accessToken);
-    if (typeof payload?.exp === "number") {
+    const payload = typeof accessToken === "string" ? decodeJwtPayload(accessToken) : null;
+    if (payload && typeof payload.exp === "number") {
       details.expiresAt = new Date(payload.exp * 1000).toISOString();
       details.expiresInSeconds = Math.floor(payload.exp - Date.now() / 1000);
     }
-  } catch (error) {
+  } catch (error: unknown) {
     details.error = error instanceof Error ? error.message : String(error);
   }
   return details;
@@ -2456,7 +2677,7 @@ function secretsDoctor() {
   };
 }
 
-function secretsCommand(args) {
+function secretsCommand(args: string[]) {
   const action = args[0];
   if (action === "list") {
     console.log(JSON.stringify({ dir: SECRETS_DIR, secrets: listStoredSecrets(SECRETS_DIR) }, null, 2));
@@ -2466,7 +2687,7 @@ function secretsCommand(args) {
     const name = String(args[1] || "").trim();
     const value = args.slice(2).join(" ").trim();
     if (!name || !value) throw new Error("Usage: sub-bridge secrets set <name> <value>");
-    if (!Object.values(SecretName).includes(name)) {
+    if (!isSecretNameValue(name)) {
       throw new Error(`Unknown secret ${name}. Allowed: ${Object.values(SecretName).join(", ")}`);
     }
     saveSecret(SECRETS_DIR, name, value);
@@ -2476,7 +2697,7 @@ function secretsCommand(args) {
   if (action === "unset") {
     const name = String(args[1] || "").trim();
     if (!name) throw new Error("Usage: sub-bridge secrets unset <name>");
-    if (!Object.values(SecretName).includes(name)) {
+    if (!isSecretNameValue(name)) {
       throw new Error(`Unknown secret ${name}. Allowed: ${Object.values(SecretName).join(", ")}`);
     }
     deleteSecret(SECRETS_DIR, name);
@@ -2503,8 +2724,8 @@ function launchdDoctor() {
   };
 }
 
-function copilotDoctor() {
-  const details = {
+function copilotDoctor(): CopilotDoctorDetails {
+  const details: CopilotDoctorDetails = {
     dbPath: COPILOT_DB,
     exists: existsSync(COPILOT_DB),
     sqlite3: commandProbe("sqlite3", ["--version"]),
@@ -2524,7 +2745,7 @@ function copilotDoctor() {
   const providerSql = `select id, name, base_url, wire_api from model_providers where id=${sqlQuote(PROVIDER_ID)};`;
   const providerResult = runProbe("sqlite3", ["-separator", "\t", COPILOT_DB, providerSql]);
   if (!providerResult.ok) {
-    details.error = providerResult.stderr || providerResult.error;
+    details.error = providerResult.stderr || providerResult.error || null;
     return details;
   }
   const [id, name, baseUrl, wireApi] = providerResult.stdout.split("\t");
@@ -2543,14 +2764,17 @@ function copilotDoctor() {
 async function doctorCommand() {
   const pid = readPid();
   const pidRunning = pid ? isPidRunning(pid) : false;
-  let health = null;
+  let health: FetchJsonResult | null = null;
   try {
     health = await fetchJson(HEALTH_URL);
-  } catch (error) {
+  } catch (error: unknown) {
     health = { ok: false, status: null, body: null, error: error instanceof Error ? error.message : String(error) };
   }
 
-  const providerDoctor = PROVIDER_PLUGIN.doctor(providerPluginContext());
+  const providerDoctor = PROVIDER_PLUGIN.doctor(providerPluginContext()) as {
+    tools: Record<string, unknown>;
+    auth: Record<string, unknown>;
+  };
   console.log(JSON.stringify({
     subscription: SUB_NAME || null,
     configPath: CONFIG_PATH,
@@ -2562,7 +2786,7 @@ async function doctorCommand() {
       healthUrl: HEALTH_URL,
       healthStatus: health?.status ?? null,
       health: health?.body || null,
-      healthError: health?.error || null,
+      healthError: health.error ?? null,
     },
     tools: {
       node: { version: process.version },
@@ -2692,24 +2916,32 @@ function modelsCommand() {
   console.log(JSON.stringify(modelsResponse(), null, 2));
 }
 
-function modelsFromJson(value) {
-  const source = Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : Array.isArray(value?.models) ? value.models : [];
+function modelsFromJson(value: unknown) {
+  const record = isPlainObject(value) ? value : {};
+  const source = Array.isArray(value)
+    ? value
+    : Array.isArray(record.data)
+      ? record.data
+      : Array.isArray(record.models)
+        ? record.models
+        : [];
   return normalizeModelList(
-    source.map((model) => {
+    source.map((model: unknown) => {
       if (typeof model === "string") return { id: model, displayName: `SubBridge ${model}` };
-      const id = model?.id || model?.modelId || model?.name;
+      const entry = isPlainObject(model) ? model : {};
+      const id = entry.id || entry.modelId || entry.name;
       return {
-        ...model,
+        ...entry,
         id,
-        displayName: model?.displayName || model?.name || id,
-        contextWindow: model?.contextWindow || model?.max_prompt_tokens || model?.maxPromptTokens,
-        maxTokens: model?.maxTokens || model?.max_output_tokens || model?.maxOutputTokens,
+        displayName: entry.displayName || entry.name || id,
+        contextWindow: entry.contextWindow || entry.max_prompt_tokens || entry.maxPromptTokens,
+        maxTokens: entry.maxTokens || entry.max_output_tokens || entry.maxOutputTokens,
       };
     }),
   );
 }
 
-function modelsFromText(text) {
+function modelsFromText(text: string) {
   const lines = String(text || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -2723,7 +2955,7 @@ function modelsFromText(text) {
   }));
 }
 
-function parseModelCommandOutput(text) {
+function parseModelCommandOutput(text: string) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return [];
   try {
@@ -2733,7 +2965,7 @@ function parseModelCommandOutput(text) {
   }
 }
 
-function mergeFetchedModels(fetchedModels, configuredModels) {
+function mergeFetchedModels(fetchedModels: unknown, configuredModels: unknown) {
   const configuredById = new Map(normalizeModelList(configuredModels).map((model) => [model.id, model]));
   const optionKeys = [
     "reasoningEffort",
@@ -2743,21 +2975,24 @@ function mergeFetchedModels(fetchedModels, configuredModels) {
     "cursorContext",
     "contextOption",
     "cursorModel",
-  ];
+  ] as const;
   return normalizeModelList(fetchedModels).map((model) => {
     const configured =
       configuredById.get(model.id) ||
       configuredById.get(stripCursorParameterizedSuffix(model.id));
     if (!configured) return model;
-    const merged = { ...model };
+    const merged: ModelEntry = { ...model };
     for (const key of optionKeys) {
-      if (configured[key] !== undefined) merged[key] = configured[key];
+      const configuredValue = configured[key];
+      if (configuredValue !== undefined) {
+        (merged as Record<string, unknown>)[key] = configuredValue;
+      }
     }
     return merged;
   });
 }
 
-function mergeCursorDiscoveredModels(primaryModels, additionalModels) {
+function mergeCursorDiscoveredModels(primaryModels: unknown, additionalModels: unknown) {
   const seen = new Set();
   const merged = [];
   for (const model of [...normalizeModelList(primaryModels), ...normalizeModelList(additionalModels)]) {
@@ -2769,7 +3004,12 @@ function mergeCursorDiscoveredModels(primaryModels, additionalModels) {
   return merged;
 }
 
-function mergeCursorCliModelSnapshot(snapshot) {
+function mergeCursorCliModelSnapshot(snapshot: {
+  source: string;
+  models: ModelEntry[];
+  offline?: boolean;
+  error?: string | null;
+}) {
   const cliSnapshot = fetchCursorModelCommandSnapshot();
   if (cliSnapshot.source === "builtin") return snapshot;
   return {
@@ -2779,12 +3019,17 @@ function mergeCursorCliModelSnapshot(snapshot) {
   };
 }
 
-async function fetchCursorModelSnapshot() {
+async function fetchCursorModelSnapshot(): Promise<{
+  models: ModelEntry[];
+  source: string;
+  offline?: boolean;
+  error?: string | null;
+}> {
   if (OFFLINE_DISCOVERY) {
     return { models: BUILTIN_MODELS, source: "builtin", offline: true };
   }
 
-  const fetchViaAcp = async (env, source) => {
+  const fetchViaAcp = async (env: NodeJS.ProcessEnv, source: string) => {
     const models = normalizeModelList(await fetchCursorAcpModels({
       command: CURSOR_ACP_COMMAND,
       apiEndpoint: CURSOR_API_ENDPOINT || undefined,
@@ -2805,7 +3050,7 @@ async function fetchCursorModelSnapshot() {
   try {
     const snapshot = await fetchViaAcp(makeCursorEnv({ forceCi: true }), "cursor-acp-agent-auth");
     if (snapshot) return mergeCursorCliModelSnapshot(snapshot);
-  } catch (error) {
+  } catch (error: unknown) {
     const fallback = fetchCursorModelCommandSnapshot();
     if (fallback.source !== "builtin") return fallback;
     return {
@@ -2852,7 +3097,7 @@ async function fetchCodexModelSnapshot() {
       maxTokens: model.maxTokens || model.max_tokens,
     })));
     if (models.length > 0) return { models, source: "pi-runtime" };
-  } catch (error) {
+  } catch (error: unknown) {
     return {
       models: BUILTIN_MODELS,
       source: "builtin",
@@ -2881,7 +3126,7 @@ const CONFIG_SCHEMA = new Map([
   ["providerName", "string"],
 ]);
 
-function parseConfigInput(key, value) {
+function parseConfigInput(key: string, value: string) {
   const type = CONFIG_SCHEMA.get(key);
   if (!type) throw new Error(`Unknown config key: ${key}`);
   if (type === "number") {
@@ -2898,7 +3143,7 @@ function parseConfigInput(key, value) {
   if (type === "json") {
     try {
       return JSON.parse(value);
-    } catch (error) {
+    } catch (error: unknown) {
       throw new Error(`Config key ${key} requires JSON`);
     }
   }
@@ -2916,7 +3161,7 @@ function configTemplate() {
   };
 }
 
-function redactedConfig(value) {
+function redactedConfig(value: unknown) {
   const copy = JSON.parse(JSON.stringify(value || {}));
   return copy;
 }
@@ -2947,7 +3192,7 @@ function cursorGroupSummary() {
   return summarizeCursorModelGroups(cursorModelsForGroupControl(), CONFIG.modelGroups);
 }
 
-function resolveCursorModelGroupId(value) {
+function resolveCursorModelGroupId(value: string) {
   const raw = String(value || "").trim();
   if (!raw) throw new Error("Usage: sub-bridge config group <enable|disable|only|preset|reset> <group...>");
   const groups = cursorGroupSummary();
@@ -2965,12 +3210,12 @@ function resolveCursorModelGroupId(value) {
   throw new Error(`Unknown model group: ${raw}`);
 }
 
-function resolveCursorModelGroupIds(values) {
+function resolveCursorModelGroupIds(values: string[]) {
   const groupIds = values.map(resolveCursorModelGroupId);
   return Array.from(new Set(groupIds));
 }
 
-function writeCursorModelGroupState(groupId, enabled) {
+function writeCursorModelGroupState(groupId: string, enabled: boolean) {
   const current = normalizeModelGroupsConfig(CONFIG.modelGroups);
   const disabled = new Set(current.disabled);
   const only = new Set(current.only);
@@ -2999,7 +3244,7 @@ function writeCursorModelGroupState(groupId, enabled) {
   });
 }
 
-function writeCursorModelGroupOnly(groupIds) {
+function writeCursorModelGroupOnly(groupIds: string[]) {
   const current = normalizeModelGroupsConfig(CONFIG.modelGroups);
   writeActiveConfigValue("modelGroups", {
     disabled: [],
@@ -3008,7 +3253,7 @@ function writeCursorModelGroupOnly(groupIds) {
   });
 }
 
-function writeCursorModelGroupPreset(preset) {
+function writeCursorModelGroupPreset(preset: string) {
   const current = normalizeModelGroupsConfig(CONFIG.modelGroups);
   const normalized = String(preset || "").trim().toLowerCase();
   if (!["latest", "off", "none", "reset"].includes(normalized)) {
@@ -3025,18 +3270,18 @@ function resetCursorModelGroups() {
   writeActiveConfigValue("modelGroups", { disabled: [], only: [], preset: "" });
 }
 
-function writeConfigFile(config) {
+function writeConfigFile(config: ConfigDocument) {
   mkdirSync(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
   const tempPath = `${CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   renameSync(tempPath, CONFIG_PATH);
 }
 
-function writeActiveConfigValue(key, value) {
+function writeActiveConfigValue(key: string, value: unknown) {
   const configKey = key;
   if (!SUB_NAME) {
     if (configKey === "$schema" || configKey === "version") {
-      writeConfigFile({ ...configDocument(), [configKey]: value });
+      writeConfigFile({ ...configDocument(), [configKey]: value } as ConfigDocument);
       return;
     }
     throw new Error(`Use --sub <name> for config set ${configKey}`);
@@ -3050,34 +3295,34 @@ function writeActiveConfigValue(key, value) {
   writeConfigFile(configDocument(subscriptions));
 }
 
-function unsetActiveConfigValue(key) {
+function unsetActiveConfigValue(key: string) {
   const configKey = key;
   if (!SUB_NAME) {
     if (configKey === "$schema" || configKey === "version") {
-      const nextConfig = configDocument();
+      const nextConfig = { ...configDocument() } as ConfigDocument & Record<string, unknown>;
       delete nextConfig[configKey];
-      writeConfigFile(nextConfig);
+      writeConfigFile(nextConfig as ConfigDocument);
       return;
     }
     throw new Error(`Use --sub <name> for config unset ${configKey}`);
   }
   const subscriptions = subscriptionsFromConfig(CONFIG_FILE);
-  const subscriptionConfig =
+  const subscriptionConfig: SubscriptionConfig =
     subscriptions[SUB_NAME] && typeof subscriptions[SUB_NAME] === "object" && !Array.isArray(subscriptions[SUB_NAME])
       ? { ...subscriptions[SUB_NAME] }
       : {};
-  delete subscriptionConfig[configKey];
+  delete (subscriptionConfig as Record<string, unknown>)[configKey];
   subscriptions[SUB_NAME] = normalizeSubscriptionConfig(subscriptionConfig);
   writeConfigFile(configDocument(subscriptions));
 }
 
-function writeSubscriptionConfig(subscriptionName, subscriptionConfig) {
+function writeSubscriptionConfig(subscriptionName: string, subscriptionConfig: SubscriptionConfig) {
   const subscriptions = subscriptionsFromConfig(CONFIG_FILE);
   subscriptions[subscriptionName] = normalizeSubscriptionConfig(subscriptionConfig);
   writeConfigFile(configDocument(subscriptions));
 }
 
-async function configCommand(args) {
+async function configCommand(args: string[]) {
   const action = args[0] || "show";
   if (action === "path") {
     console.log(CONFIG_PATH);
@@ -3110,15 +3355,16 @@ async function configCommand(args) {
   }
   if (action === "get") {
     const key = args[1];
-    if (!CONFIG_SCHEMA.has(key)) throw new Error(`Unknown config key: ${key}`);
+    if (!key || !CONFIG_SCHEMA.has(key)) throw new Error(`Unknown config key: ${key}`);
     if (!SUB_NAME && key !== "$schema" && key !== "version") {
       throw new Error(`Use --sub <name> for config get ${key}`);
     }
     if (key === "$schema" || key === "version") {
-      console.log(JSON.stringify(configDocument()[key], null, 2));
+      console.log(JSON.stringify(configDocument()[key as "$schema" | "version"], null, 2));
       return;
     }
-    const value = effectiveConfig()[key] ?? CONFIG[key] ?? null;
+    const effective = effectiveConfig() as Record<string, unknown>;
+    const value = effective[key] ?? (CONFIG as Record<string, unknown>)[key] ?? null;
     console.log(JSON.stringify(value, null, 2));
     return;
   }
@@ -3177,7 +3423,7 @@ async function configCommand(args) {
   throw new Error(`Unknown config command: ${action}`);
 }
 
-function extractOutputTextFromSse(text) {
+function extractOutputTextFromSse(text: string) {
   let doneText = "";
   let deltaText = "";
   for (const line of text.split(/\r?\n/)) {
@@ -3212,7 +3458,7 @@ async function checkCommand() {
     ],
   });
 
-  const headers = { "content-type": "application/json" };
+  const headers: Record<string, string> = { "content-type": "application/json" };
   if (BRIDGE_KEY) headers.authorization = `Bearer ${BRIDGE_KEY}`;
   const response = await fetch(`${BASE_URL}/responses`, { method: "POST", headers, body });
   const text = await response.text();
@@ -3226,7 +3472,7 @@ async function checkCommand() {
   }, null, 2));
 }
 
-function sqlQuote(value) {
+function sqlQuote(value: unknown) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
@@ -3429,7 +3675,7 @@ function targetsCommand() {
   console.log(JSON.stringify(TARGETS.map(({ id, name, status }) => ({ id, name, status })), null, 2));
 }
 
-function installTargetForSubscription(subscriptionName, targetId) {
+function installTargetForSubscription(subscriptionName: string, targetId: string) {
   const result = spawnSync(process.execPath, [process.argv[1], "--sub", subscriptionName, "install", targetId], {
     stdio: "inherit",
     env: process.env,

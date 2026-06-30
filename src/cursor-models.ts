@@ -1,7 +1,19 @@
-// @ts-nocheck
+import type { ModelGroupsConfig } from "./types/config";
+import type {
+  CursorConfigOption,
+  CursorContextWindowOption,
+  CursorModelChoice,
+  CursorModelEntry,
+  CursorModelGroupEntry,
+  CursorModelGroupSummary,
+  CursorModelOptions,
+  CursorReasoningEffort,
+  CursorSelectOptionEntry,
+} from "./types/cursor";
+
 export const CURSOR_LIST_AVAILABLE_MODELS_METHOD = "cursor/list_available_models";
 
-function normalizedText(value) {
+function normalizedText(value: unknown): string {
   return String(value || "")
     .trim()
     .toLowerCase()
@@ -9,16 +21,16 @@ function normalizedText(value) {
     .trim();
 }
 
-export function stripCursorParameterizedSuffix(value) {
+export function stripCursorParameterizedSuffix(value: unknown): string {
   const trimmed = String(value || "").trim();
   const suffixStart = trimmed.indexOf("[");
   return suffixStart >= 0 ? trimmed.slice(0, suffixStart).trim() : trimmed;
 }
 
-function parseCursorModelParameters(value) {
+function parseCursorModelParameters(value: unknown): Map<string, string> {
   const match = String(value || "").match(/\[([^\]]*)\]$/u);
   if (!match?.[1]) return new Map();
-  const params = new Map();
+  const params = new Map<string, string>();
   for (const part of match[1].split(",")) {
     const separatorIndex = part.indexOf("=");
     if (separatorIndex <= 0) continue;
@@ -29,24 +41,29 @@ function parseCursorModelParameters(value) {
   return params;
 }
 
-function cursorModelParametersToObject(value) {
+function cursorModelParametersToObject(value: unknown): Record<string, string> {
   return Object.fromEntries(parseCursorModelParameters(value).entries());
 }
 
-function buildCursorParameterizedModelSlug(baseModel, params) {
-  const entries = Object.entries(params).filter(([, value]) => String(value || "").trim());
+function buildCursorParameterizedModelSlug(baseModel: string, params: Record<string, string>): string {
+  const entries = Object.entries(params).filter(([, paramValue]) => String(paramValue || "").trim());
   if (entries.length === 0) return baseModel;
   return `${baseModel}[${entries.map(([key, value]) => `${key}=${value}`).join(",")}]`;
 }
 
-function flattenSelectOptions(option) {
+function flattenSelectOptions(option: CursorConfigOption | undefined): Array<{
+  value: string;
+  name: string;
+  groupId?: string;
+  groupName?: string;
+}> {
   if (!option || option.type !== "select" || !Array.isArray(option.options)) return [];
-  return option.options.flatMap((entry) => {
+  return option.options.flatMap((entry: CursorSelectOptionEntry) => {
     if (typeof entry?.value === "string") {
       return [{ value: entry.value.trim(), name: String(entry.name || entry.value).trim() }];
     }
     if (Array.isArray(entry?.options)) {
-      return entry.options.flatMap((child) =>
+      return entry.options.flatMap((child: CursorSelectOptionEntry) =>
         typeof child?.value === "string"
           ? [{
               value: child.value.trim(),
@@ -61,14 +78,14 @@ function flattenSelectOptions(option) {
   });
 }
 
-function findModelConfig(configOptions) {
+function findModelConfig(configOptions: CursorConfigOption[]): CursorConfigOption | undefined {
   return (
     configOptions.find((option) => option?.category === "model" && typeof option.id === "string") ||
     configOptions.find((option) => option?.id === "model")
   );
 }
 
-function findConfigOption(configOptions, aliases) {
+function findConfigOption(configOptions: CursorConfigOption[], aliases: string[]): CursorConfigOption | undefined {
   const normalizedAliases = aliases.map(normalizedText);
   return configOptions.find((option) => {
     const haystack = normalizedText(`${option?.id || ""} ${option?.name || ""} ${option?.category || ""}`);
@@ -76,9 +93,9 @@ function findConfigOption(configOptions, aliases) {
   });
 }
 
-function humanizeCursorModelName(value) {
+function humanizeCursorModelName(value: unknown): string {
   const base = stripCursorParameterizedSuffix(value);
-  if (!base) return value;
+  if (!base) return String(value || "");
   return base
     .split(/[-_/]+/u)
     .filter(Boolean)
@@ -101,7 +118,7 @@ function humanizeCursorModelName(value) {
     .join(" ");
 }
 
-function normalizeCursorAcpModelName(choice) {
+function normalizeCursorAcpModelName(choice: { value: string; name?: string }): string {
   const rawName = String(choice.name || "").trim();
   const rawBase = stripCursorParameterizedSuffix(choice.value);
   if (
@@ -114,7 +131,12 @@ function normalizeCursorAcpModelName(choice) {
   return humanizeCursorModelName(choice.value);
 }
 
-function inferCursorUpstreamProvider(choice) {
+function inferCursorUpstreamProvider(choice: {
+  value?: string;
+  name?: string;
+  groupId?: string;
+  groupName?: string;
+}): { upstreamProviderId: string; upstreamProviderName: string } {
   const groupId = String(choice.groupId || "").trim();
   const groupName = String(choice.groupName || "").trim();
   if (groupId || groupName) {
@@ -145,9 +167,9 @@ function inferCursorUpstreamProvider(choice) {
   return { upstreamProviderId: "cursor", upstreamProviderName: "Cursor" };
 }
 
-function flattenCursorAcpModelChoices(configOptions) {
-  const seen = new Set();
-  const choices = [];
+function flattenCursorAcpModelChoices(configOptions: CursorConfigOption[]): CursorModelChoice[] {
+  const seen = new Set<string>();
+  const choices: CursorModelChoice[] = [];
   for (const choice of flattenSelectOptions(findModelConfig(configOptions))) {
     if (!choice.value || seen.has(choice.value)) continue;
     seen.add(choice.value);
@@ -161,7 +183,7 @@ function flattenCursorAcpModelChoices(configOptions) {
   return choices;
 }
 
-export function normalizeCursorReasoningValue(value) {
+export function normalizeCursorReasoningValue(value: unknown): string {
   const normalized = String(value || "").trim().toLowerCase();
   switch (normalized) {
     case "none":
@@ -179,17 +201,17 @@ export function normalizeCursorReasoningValue(value) {
   }
 }
 
-function cursorReasoningParameterValue(value) {
+function cursorReasoningParameterValue(value: string): string {
   return value === "xhigh" ? "extra-high" : value;
 }
 
-function cursorReasoningLabel(value) {
+function cursorReasoningLabel(value: string): string {
   if (value === "xhigh") return "Extra High";
   if (value === "max") return "Max";
   return `${value.slice(0, 1).toUpperCase()}${value.slice(1)}`;
 }
 
-function findCursorEffortConfigOption(configOptions) {
+function findCursorEffortConfigOption(configOptions: CursorConfigOption[]): CursorConfigOption | undefined {
   const candidates = configOptions.filter((option) => {
     if (option?.type !== "select") return false;
     const id = String(option.id || "").trim().toLowerCase();
@@ -212,22 +234,22 @@ function findCursorEffortConfigOption(configOptions) {
   );
 }
 
-function isCursorContextConfigOption(option) {
+function isCursorContextConfigOption(option: CursorConfigOption | undefined): boolean {
   const id = String(option?.id || "").trim().toLowerCase();
   const name = String(option?.name || "").trim().toLowerCase();
   return id === "context" || id === "context_size" || name.includes("context");
 }
 
-function findCursorContextConfigOption(configOptions) {
+function findCursorContextConfigOption(configOptions: CursorConfigOption[]): CursorConfigOption | undefined {
   return configOptions.find((option) => option?.category === "model_config" && isCursorContextConfigOption(option)) ||
     configOptions.find(isCursorContextConfigOption);
 }
 
-function findCursorBooleanOption(configOptions, id) {
+function findCursorBooleanOption(configOptions: CursorConfigOption[], id: string): CursorConfigOption | undefined {
   return configOptions.find((option) => String(option?.id || "").trim().toLowerCase() === id);
 }
 
-function contextWindowTokens(value, fallback = 128000) {
+function contextWindowTokens(value: unknown, fallback = 128000): number {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return fallback;
   const match = raw.match(/^(\d+(?:\.\d+)?)(k|m)?$/u);
@@ -240,14 +262,27 @@ function contextWindowTokens(value, fallback = 128000) {
   return Math.round(amount);
 }
 
-function cursorContextWindowLabel(value) {
+function cursorContextWindowLabel(value: unknown): string {
   const normalized = String(value || "").trim();
   return normalized.toLowerCase() === "1m" ? "1M" : normalized.toUpperCase();
 }
 
-function buildModelEntry(input) {
+function buildModelEntry(input: {
+  id: string;
+  displayName?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  upstreamProviderId?: string;
+  upstreamProviderName?: string;
+  supportedReasoningEfforts?: CursorReasoningEffort[];
+  defaultReasoningEffort?: string;
+  supportsFastMode?: boolean;
+  supportsThinking?: boolean;
+  contextWindowOptions?: CursorContextWindowOption[];
+  defaultContextWindow?: string;
+}): CursorModelEntry {
   const id = input.id === "default" ? "auto" : input.id;
-  const entry = {
+  const entry: CursorModelEntry = {
     id,
     displayName: input.displayName || humanizeCursorModelName(id),
     contextWindow: input.contextWindow || 128000,
@@ -264,7 +299,7 @@ function buildModelEntry(input) {
   return entry;
 }
 
-export function cursorModelsFromConfigOptions(configOptions) {
+export function cursorModelsFromConfigOptions(configOptions: unknown): CursorModelEntry[] {
   const choices = flattenCursorAcpModelChoices(Array.isArray(configOptions) ? configOptions : []);
   return choices.map((choice) => buildModelEntry({
     id: choice.slug,
@@ -276,11 +311,12 @@ export function cursorModelsFromConfigOptions(configOptions) {
   }));
 }
 
-export function cursorModelsFromAvailableModels(models) {
-  const seen = new Set();
-  const entries = [];
+export function cursorModelsFromAvailableModels(models: unknown): CursorModelEntry[] {
+  const seen = new Set<string>();
+  const entries: CursorModelEntry[] = [];
   for (const model of Array.isArray(models) ? models : []) {
-    const rawId = String(model?.value || model?.id || "").trim();
+    const modelRecord = model as Record<string, unknown>;
+    const rawId = String(modelRecord?.value || modelRecord?.id || "").trim();
     if (!rawId) continue;
     const id = rawId === "default" ? "auto" : rawId;
     if (seen.has(id)) continue;
@@ -331,9 +367,9 @@ export function cursorModelsFromAvailableModels(models) {
   return entries;
 }
 
-export function parseCursorCliModelList(stdout) {
-  const seen = new Set();
-  const models = [];
+export function parseCursorCliModelList(stdout: unknown): CursorModelEntry[] {
+  const seen = new Set<string>();
+  const models: CursorModelEntry[] = [];
   for (const line of String(stdout || "").split(/\r?\n/u)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed === "Available models" || trimmed.startsWith("Tip:")) continue;
@@ -348,13 +384,15 @@ export function parseCursorCliModelList(stdout) {
       displayName: name || humanizeCursorModelName(id),
       contextWindow: contextWindowTokens(options.contextWindow, 128000),
       maxTokens: 128000,
-      ...options,
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...(options.fastMode ? { fastMode: options.fastMode } : {}),
+      ...(options.thinking ? { thinking: options.thinking } : {}),
     });
   }
   return models;
 }
 
-function normalizeCursorCliBaseModelId(model) {
+function normalizeCursorCliBaseModelId(model: unknown): string {
   const trimmed = String(model || "").trim();
   let withoutVariantSuffixes = trimmed
     .replace(/^claude-(\d+(?:\.\d+)?)-([a-z]+)-max$/u, "claude-$1-$2")
@@ -379,11 +417,11 @@ function normalizeCursorCliBaseModelId(model) {
   return withoutVariantSuffixes;
 }
 
-export function normalizeCursorModelVariantBaseId(model) {
+export function normalizeCursorModelVariantBaseId(model: unknown): string {
   return normalizeCursorCliBaseModelId(stripCursorParameterizedSuffix(model));
 }
 
-function parseCursorCliReasoningEffort(model) {
+function parseCursorCliReasoningEffort(model: unknown): string {
   const tokens = String(model || "").trim().toLowerCase().split("-");
   for (let index = tokens.length - 1; index >= 0; index -= 1) {
     const token = tokens[index];
@@ -395,7 +433,7 @@ function parseCursorCliReasoningEffort(model) {
   return "";
 }
 
-function isCursorCliOneMillionContextModel(model) {
+function isCursorCliOneMillionContextModel(model: unknown): boolean {
   const normalized = String(model || "").trim().toLowerCase();
   return (
     normalized.startsWith("gpt-5.5-") ||
@@ -405,7 +443,7 @@ function isCursorCliOneMillionContextModel(model) {
   );
 }
 
-export function cursorModelOptionsFromCliModelId(model) {
+export function cursorModelOptionsFromCliModelId(model: unknown): CursorModelOptions {
   const trimmed = String(model || "").trim();
   if (!trimmed || trimmed.includes("[")) return {};
   const lower = trimmed.toLowerCase();
@@ -418,9 +456,9 @@ export function cursorModelOptionsFromCliModelId(model) {
   };
 }
 
-function uniqueByValue(values) {
-  const seen = new Set();
-  const result = [];
+function uniqueByValue<T extends { value?: string }>(values: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
   for (const value of values) {
     if (!value?.value || seen.has(value.value)) continue;
     seen.add(value.value);
@@ -429,7 +467,7 @@ function uniqueByValue(values) {
   return result;
 }
 
-function removeVariantNameSuffix(name) {
+function removeVariantNameSuffix(name: unknown): string {
   return String(name || "")
     .replace(/\s+Fast$/iu, "")
     .replace(/\s+Thinking$/iu, "")
@@ -439,20 +477,20 @@ function removeVariantNameSuffix(name) {
     .trim();
 }
 
-function defaultEffortForCursorGroup(baseId, efforts) {
+function defaultEffortForCursorGroup(baseId: string, efforts: string[]): string {
   if (efforts.length === 0) return "";
   if (baseId.includes("gpt") || baseId.includes("codex")) return efforts.includes("medium") ? "medium" : efforts[0];
   if (baseId.includes("claude")) return efforts.includes("high") ? "high" : efforts[0];
   return efforts[0];
 }
 
-function isCursorOneMillionVariant(model) {
+function isCursorOneMillionVariant(model: CursorModelEntry): boolean {
   if (model.defaultContextWindow === "1m") return true;
-  if (model.contextWindowOptions?.some((option) => option.value === "1m" && option.isDefault === true)) return true;
+  if (model.contextWindowOptions?.some((option: CursorContextWindowOption) => option.value === "1m" && option.isDefault === true)) return true;
   return /\b1M\b/u.test(model.displayName || "");
 }
 
-function fallbackContextWindowOptionsForCursorBase(baseId, variants) {
+function fallbackContextWindowOptionsForCursorBase(baseId: string, variants: CursorModelEntry[]): CursorContextWindowOption[] {
   if (!variants.some(isCursorOneMillionVariant)) return [];
   if (baseId === "gpt-5.5" || baseId === "gpt-5.4") {
     return [
@@ -475,7 +513,14 @@ function fallbackContextWindowOptionsForCursorBase(baseId, variants) {
   return [];
 }
 
-function cursorVariantDisplayName(baseName, { contextWindow, reasoningEffort, fastMode, thinking }) {
+interface CursorVariantOptions {
+  contextWindow?: string;
+  reasoningEffort?: string;
+  fastMode?: boolean;
+  thinking?: boolean;
+}
+
+function cursorVariantDisplayName(baseName: string, { contextWindow, reasoningEffort, fastMode, thinking }: CursorVariantOptions): string {
   const parts = [removeVariantNameSuffix(baseName) || baseName];
   if (contextWindow) parts.push(cursorContextWindowLabel(contextWindow));
   if (reasoningEffort) parts.push(cursorReasoningLabel(reasoningEffort));
@@ -484,8 +529,8 @@ function cursorVariantDisplayName(baseName, { contextWindow, reasoningEffort, fa
   return parts.filter(Boolean).join(" ");
 }
 
-function cursorVariantId(baseId, { contextWindow, reasoningEffort, fastMode, thinking }) {
-  const params = {};
+function cursorVariantId(baseId: string, { contextWindow, reasoningEffort, fastMode, thinking }: CursorVariantOptions): string {
+  const params: Record<string, string> = {};
   if (contextWindow) params.context = contextWindow;
   if (reasoningEffort) params.effort = cursorReasoningParameterValue(reasoningEffort);
   if (fastMode) params.fast = "true";
@@ -493,7 +538,12 @@ function cursorVariantId(baseId, { contextWindow, reasoningEffort, fastMode, thi
   return buildCursorParameterizedModelSlug(baseId, params);
 }
 
-function cursorVariantOptionsForModel(model) {
+function cursorVariantOptionsForModel(model: CursorModelEntry): {
+  efforts: string[];
+  contexts: string[];
+  fastModes: boolean[];
+  thinkingModes: boolean[];
+} {
   const effortValues = uniqueByValue([
     ...(model.supportedReasoningEfforts || []),
     ...(model.defaultReasoningEffort ? [{ value: model.defaultReasoningEffort, label: cursorReasoningLabel(model.defaultReasoningEffort) }] : []),
@@ -517,7 +567,7 @@ function cursorVariantOptionsForModel(model) {
   };
 }
 
-function generatedCursorVariantsForModel(model) {
+function generatedCursorVariantsForModel(model: CursorModelEntry): CursorModelEntry[] {
   const baseId = normalizeCursorModelVariantBaseId(model.id);
   if (!baseId || model.id.includes("[") || normalizeCursorModelVariantBaseId(model.id) !== model.id) return [];
   const { efforts, contexts, fastModes, thinkingModes } = cursorVariantOptionsForModel(model);
@@ -529,7 +579,7 @@ function generatedCursorVariantsForModel(model) {
   ) {
     return [];
   }
-  const variants = [];
+  const variants: CursorModelEntry[] = [];
   for (const contextWindow of contexts) {
     for (const reasoningEffort of efforts) {
       for (const fastMode of fastModes) {
@@ -559,21 +609,22 @@ function generatedCursorVariantsForModel(model) {
   return variants;
 }
 
-export function collapseCursorModelVariants(models) {
-  const groups = new Map();
+export function collapseCursorModelVariants(models: unknown): CursorModelEntry[] {
+  const groups = new Map<string, CursorModelEntry[]>();
   for (const model of Array.isArray(models) ? models : []) {
-    const baseId = normalizeCursorModelVariantBaseId(model.id) || model.id;
+    const entry = model as CursorModelEntry;
+    const baseId = normalizeCursorModelVariantBaseId(entry.id) || entry.id;
     const group = groups.get(baseId);
-    if (group) group.push(model);
-    else groups.set(baseId, [model]);
+    if (group) group.push(entry);
+    else groups.set(baseId, [entry]);
   }
 
   return Array.from(groups.entries()).map(([baseId, variants]) => {
     const preferred =
-      variants.find((variant) => variant.id === baseId) ||
-      variants.find((variant) => !variant.id.endsWith("-fast")) ||
+      variants.find((variant: CursorModelEntry) => variant.id === baseId) ||
+      variants.find((variant: CursorModelEntry) => !variant.id.endsWith("-fast")) ||
       variants[0];
-    const efforts = uniqueByValue(variants.flatMap((variant) => [
+    const efforts = uniqueByValue(variants.flatMap((variant: CursorModelEntry) => [
       ...(variant.supportedReasoningEfforts || []),
       ...(parseCursorCliReasoningEffort(variant.id)
         ? [{ value: parseCursorCliReasoningEffort(variant.id), label: cursorReasoningLabel(parseCursorCliReasoningEffort(variant.id)) }]
@@ -584,11 +635,11 @@ export function collapseCursorModelVariants(models) {
     ]));
     const effortValues = efforts.map((effort) => effort.value);
     const defaultEffort =
-      variants.find((variant) => normalizeCursorModelVariantBaseId(variant.id) === variant.id)?.defaultReasoningEffort ||
+      variants.find((variant: CursorModelEntry) => normalizeCursorModelVariantBaseId(variant.id) === variant.id)?.defaultReasoningEffort ||
       defaultEffortForCursorGroup(baseId, effortValues);
     const contextWindowOptions = uniqueByValue([
       ...fallbackContextWindowOptionsForCursorBase(baseId, variants),
-      ...variants.flatMap((variant) => variant.contextWindowOptions || []),
+      ...variants.flatMap((variant: CursorModelEntry) => variant.contextWindowOptions || []),
     ]);
     const upstreamProviderId = preferred?.upstreamProviderId;
     const upstreamProviderName = preferred?.upstreamProviderName;
@@ -608,8 +659,8 @@ export function collapseCursorModelVariants(models) {
         ...(effort.value === defaultEffort ? { isDefault: true } : {}),
       })),
       defaultReasoningEffort: defaultEffort,
-      supportsFastMode: variants.some((variant) => variant.supportsFastMode === true),
-      supportsThinking: variants.some((variant) => variant.supportsThinking === true),
+      supportsFastMode: variants.some((variant: CursorModelEntry) => variant.supportsFastMode === true),
+      supportsThinking: variants.some((variant: CursorModelEntry) => variant.supportsThinking === true),
       contextWindowOptions,
       defaultContextWindow:
         contextWindowOptions.find((option) => option.isDefault)?.value ||
@@ -619,11 +670,11 @@ export function collapseCursorModelVariants(models) {
   });
 }
 
-export function mergeCursorModelVariantsWithBaseControls(models) {
-  const normalized = Array.isArray(models) ? models : [];
+export function mergeCursorModelVariantsWithBaseControls(models: unknown): CursorModelEntry[] {
+  const normalized = Array.isArray(models) ? (models as CursorModelEntry[]) : [];
   const expanded = normalized.flatMap((model) => [model, ...generatedCursorVariantsForModel(model)]);
-  const seen = new Set();
-  const merged = [];
+  const seen = new Set<string>();
+  const merged: CursorModelEntry[] = [];
   for (const model of [...collapseCursorModelVariants(expanded), ...expanded]) {
     const key = String(model?.id || "").trim().toLowerCase();
     if (!key || seen.has(key)) continue;
@@ -633,22 +684,22 @@ export function mergeCursorModelVariantsWithBaseControls(models) {
   return dedupeCursorModelsByVisibleName(merged);
 }
 
-function cursorVisibleModelKey(model) {
+function cursorVisibleModelKey(model: CursorModelEntry): string {
   const familyId = normalizeCursorModelVariantBaseId(model?.id) || String(model?.id || "").trim();
   const displayName = String(model?.displayName || humanizeCursorModelName(model?.id)).trim();
   return `${familyId}|${normalizedText(displayName)}`;
 }
 
-function cursorVisibleModelPriority(model) {
+function cursorVisibleModelPriority(model: CursorModelEntry): number {
   const id = String(model?.id || "").trim();
   if (id.includes("[")) return 0;
   if (normalizeCursorModelVariantBaseId(id) === id) return 1;
   return 2;
 }
 
-function dedupeCursorModelsByVisibleName(models) {
-  const entries = [];
-  const byKey = new Map();
+function dedupeCursorModelsByVisibleName(models: CursorModelEntry[]): CursorModelEntry[] {
+  const entries: CursorModelEntry[] = [];
+  const byKey = new Map<string, number>();
   for (const model of models) {
     const key = cursorVisibleModelKey(model);
     const existingIndex = byKey.get(key);
@@ -665,7 +716,7 @@ function dedupeCursorModelsByVisibleName(models) {
   return entries;
 }
 
-const CURSOR_MODEL_PRESETS = {
+const CURSOR_MODEL_PRESETS: Record<string, Array<{ id: string; displayName: string }>> = {
   latest: [
     { id: "claude-opus-4-8[context=1m,effort=high]", displayName: "Opus 4.8" },
     { id: "claude-opus-4-8[context=1m,effort=high,fast=true]", displayName: "Opus 4.8 Fast" },
@@ -679,12 +730,12 @@ const CURSOR_MODEL_PRESETS = {
   ],
 };
 
-function normalizeCursorModelPreset(value) {
+function normalizeCursorModelPreset(value: unknown): keyof typeof CURSOR_MODEL_PRESETS | "" {
   const preset = String(value || "").trim().toLowerCase();
-  return Object.prototype.hasOwnProperty.call(CURSOR_MODEL_PRESETS, preset) ? preset : "";
+  return Object.prototype.hasOwnProperty.call(CURSOR_MODEL_PRESETS, preset) ? (preset as keyof typeof CURSOR_MODEL_PRESETS) : "";
 }
 
-function applyCursorModelPreset(models, preset) {
+function applyCursorModelPreset(models: CursorModelEntry[], preset: keyof typeof CURSOR_MODEL_PRESETS | ""): CursorModelEntry[] {
   const rules = CURSOR_MODEL_PRESETS[preset] || [];
   if (rules.length === 0) return models;
   const byId = new Map((Array.isArray(models) ? models : []).map((model) => [String(model?.id || "").trim(), model]));
@@ -694,7 +745,7 @@ function applyCursorModelPreset(models, preset) {
   });
 }
 
-export function cursorModelGroupEntries(model) {
+export function cursorModelGroupEntries(model: CursorModelEntry): CursorModelGroupEntry[] {
   const providerId = String(model?.upstreamProviderId || "cursor").trim().toLowerCase() || "cursor";
   const providerName = String(model?.upstreamProviderName || "Cursor").trim() || "Cursor";
   const familyId = normalizeCursorModelVariantBaseId(model?.id) || String(model?.id || "").trim();
@@ -705,23 +756,24 @@ export function cursorModelGroupEntries(model) {
   ];
 }
 
-export function normalizeModelGroupsConfig(config) {
-  const disabled = Array.isArray(config?.disabled) ? config.disabled : [];
-  const only = Array.isArray(config?.only) ? config.only : [];
+export function normalizeModelGroupsConfig(config: unknown): ModelGroupsConfig & { preset: keyof typeof CURSOR_MODEL_PRESETS | "" } {
+  const record = config as ModelGroupsConfig | undefined;
+  const disabled = Array.isArray(record?.disabled) ? record.disabled : [];
+  const only = Array.isArray(record?.only) ? record.only : [];
   return {
     disabled: Array.from(new Set(disabled.map((value) => String(value || "").trim()).filter(Boolean))).sort(),
     only: Array.from(new Set(only.map((value) => String(value || "").trim()).filter(Boolean))),
-    preset: normalizeCursorModelPreset(config?.preset),
+    preset: normalizeCursorModelPreset(record?.preset),
   };
 }
 
-export function filterCursorModelsByGroups(models, config) {
+export function filterCursorModelsByGroups(models: unknown, config: unknown): CursorModelEntry[] {
   const groupsConfig = normalizeModelGroupsConfig(config);
   const disabled = new Set(groupsConfig.disabled);
   const only = new Set(groupsConfig.only);
   const normalized = Array.isArray(models) ? models : [];
   if (disabled.size === 0 && only.size === 0) return applyCursorModelPreset(normalized, groupsConfig.preset);
-  const onlyOrder = new Map(groupsConfig.only.map((groupId, index) => [groupId, index]));
+  const onlyOrder = new Map((groupsConfig.only ?? []).map((groupId, index) => [groupId, index]));
   const filtered = normalized.flatMap((model, index) => {
     const groupIds = cursorModelGroupEntries(model).map((group) => group.id);
     const selected = only.size === 0 || groupIds.some((groupId) => only.has(groupId));
@@ -739,12 +791,12 @@ export function filterCursorModelsByGroups(models, config) {
   return applyCursorModelPreset(grouped, groupsConfig.preset);
 }
 
-export function summarizeCursorModelGroups(models, config) {
+export function summarizeCursorModelGroups(models: unknown, config: unknown): CursorModelGroupSummary[] {
   const groupsConfig = normalizeModelGroupsConfig(config);
   const disabled = new Set(groupsConfig.disabled);
   const only = new Set(groupsConfig.only);
   const filtered = new Set(filterCursorModelsByGroups(models, config).map((model) => String(model?.id || "").trim()));
-  const byId = new Map();
+  const byId = new Map<string, CursorModelGroupSummary>();
   for (const model of Array.isArray(models) ? models : []) {
     const active = filtered.has(String(model?.id || "").trim());
     for (const group of cursorModelGroupEntries(model)) {
@@ -768,7 +820,7 @@ export function summarizeCursorModelGroups(models, config) {
   );
 }
 
-function cursorModelOptionsFromModelParameters(model) {
+function cursorModelOptionsFromModelParameters(model: unknown): CursorModelOptions {
   const params = parseCursorModelParameters(model);
   const reasoningEffort = normalizeCursorReasoningValue(params.get("reasoning") || params.get("effort"));
   const contextWindow = String(params.get("context") || "").trim();
@@ -784,11 +836,12 @@ function cursorModelOptionsFromModelParameters(model) {
   };
 }
 
-export function cursorOptionsFromModelEntry(model) {
+export function cursorOptionsFromModelEntry(model: unknown): CursorModelOptions {
   if (!model || typeof model !== "object") return {};
-  const explicitContextWindow = model.cursorContextWindow || model.cursorContext || model.contextOption;
-  const defaultContextWindow = model.defaultContextWindow;
-  const rawReasoningEffort = model.reasoningEffort || model.defaultReasoningEffort;
+  const entry = model as CursorModelEntry;
+  const explicitContextWindow = entry.cursorContextWindow || entry.cursorContext || entry.contextOption;
+  const defaultContextWindow = entry.defaultContextWindow;
+  const rawReasoningEffort = entry.reasoningEffort || entry.defaultReasoningEffort;
   const normalizedReasoningEffort = String(rawReasoningEffort || "").trim().toLowerCase();
   const reasoningEffort =
     normalizedReasoningEffort && !["off", "false", "0", "disabled", "fast", "true", "1"].includes(normalizedReasoningEffort)
@@ -805,17 +858,17 @@ export function cursorOptionsFromModelEntry(model) {
     ...(explicitContextWindow || defaultContextWindow
       ? { contextWindow: String(explicitContextWindow || defaultContextWindow) }
       : {}),
-    ...(typeof model.fastMode === "boolean"
-      ? { fastMode: model.fastMode }
+    ...(typeof entry.fastMode === "boolean"
+      ? { fastMode: entry.fastMode }
       : fastModeFromReasoning !== undefined
         ? { fastMode: fastModeFromReasoning }
         : {}),
-    ...(typeof model.thinking === "boolean" ? { thinking: model.thinking } : {}),
+    ...(typeof entry.thinking === "boolean" ? { thinking: entry.thinking } : {}),
   };
 }
 
-export function mergeCursorModelOptions(...sources) {
-  const merged = {};
+export function mergeCursorModelOptions(...sources: Array<CursorModelOptions | null | undefined>): CursorModelOptions | undefined {
+  const merged: CursorModelOptions = {};
   for (const source of sources) {
     if (!source || typeof source !== "object") continue;
     if (source.reasoningEffort) merged.reasoningEffort = source.reasoningEffort;
@@ -826,41 +879,52 @@ export function mergeCursorModelOptions(...sources) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-export function resolveReasoningEffortForModel(modelConfig, fallbackReasoningEffort) {
+export function resolveReasoningEffortForModel(modelConfig: unknown, fallbackReasoningEffort?: string): string | undefined {
   if (!modelConfig || typeof modelConfig !== "object") return undefined;
-  if (typeof modelConfig.reasoningEffort === "string" && modelConfig.reasoningEffort.trim()) {
-    return modelConfig.reasoningEffort.trim();
+  const config = modelConfig as CursorModelEntry;
+  if (typeof config.reasoningEffort === "string" && config.reasoningEffort.trim()) {
+    return config.reasoningEffort.trim();
   }
-  if (typeof modelConfig.defaultReasoningEffort === "string" && modelConfig.defaultReasoningEffort.trim()) {
-    return modelConfig.defaultReasoningEffort.trim();
+  if (typeof config.defaultReasoningEffort === "string" && config.defaultReasoningEffort.trim()) {
+    return config.defaultReasoningEffort.trim();
   }
-  if (Array.isArray(modelConfig.supportedReasoningEfforts) && modelConfig.supportedReasoningEfforts.length > 0) {
-    const defaultEntry = modelConfig.supportedReasoningEfforts.find((item) => item?.isDefault);
+  if (Array.isArray(config.supportedReasoningEfforts) && config.supportedReasoningEfforts.length > 0) {
+    const defaultEntry = config.supportedReasoningEfforts.find((item) => item?.isDefault);
     if (defaultEntry?.value) return String(defaultEntry.value);
     return fallbackReasoningEffort;
   }
   return undefined;
 }
 
-function cursorAcpParameterKeyForModel(baseModel, options) {
+function cursorAcpParameterKeyForModel(baseModel: string, options: CursorModelOptions | undefined): string {
   if (options?.reasoningEffort && String(baseModel || "").includes("claude")) return "effort";
   return "reasoning";
 }
 
-function cursorChoiceMatchesBase(choice, baseModel) {
+function cursorChoiceMatchesBase(choice: CursorModelChoice, baseModel: string): boolean {
   const choiceBase = resolveCursorAcpBaseModelId(choice.slug);
   const cliBaseModel = normalizeCursorCliBaseModelId(baseModel);
   return choiceBase === baseModel || choiceBase === cliBaseModel;
 }
 
-function cursorParameterValuesMatch(key, left, right) {
+function cursorParameterValuesMatch(key: string, left: unknown, right: unknown): boolean {
   if (key === "reasoning" || key === "effort") {
     return normalizeCursorReasoningValue(left) === normalizeCursorReasoningValue(right);
   }
   return normalizedText(left) === normalizedText(right);
 }
 
-function resolveCursorChoiceParameterValue({ choices, baseModel, key, requestedValue }) {
+function resolveCursorChoiceParameterValue({
+  choices,
+  baseModel,
+  key,
+  requestedValue,
+}: {
+  choices: CursorModelChoice[];
+  baseModel: string;
+  key: string;
+  requestedValue: unknown;
+}): string | undefined {
   let sawParameterizedChoice = false;
   for (const choice of choices) {
     if (!cursorChoiceMatchesBase(choice, baseModel)) continue;
@@ -869,10 +933,20 @@ function resolveCursorChoiceParameterValue({ choices, baseModel, key, requestedV
     sawParameterizedChoice = true;
     if (cursorParameterValuesMatch(key, value, requestedValue)) return value;
   }
-  return sawParameterizedChoice ? undefined : requestedValue;
+  return sawParameterizedChoice ? undefined : String(requestedValue ?? "");
 }
 
-function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choices, requestedModel }) {
+function buildCursorParameterizedModelFromOptions({
+  acpModelValue,
+  options,
+  choices,
+  requestedModel,
+}: {
+  acpModelValue: string;
+  options: CursorModelOptions;
+  choices: CursorModelChoice[];
+  requestedModel: string;
+}): string | undefined {
   const hasOptions = options && Object.keys(options).length > 0;
   const requestedHasParams = String(requestedModel || "").includes("[");
   if (!hasOptions && !requestedHasParams) return undefined;
@@ -882,7 +956,7 @@ function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choi
   const params = { ...requestedParams, ...acpParams };
   const requestedParamKeys = new Set(Object.keys(requestedParams));
   const acpParamKeys = new Set(Object.keys(acpParams));
-  const slugUsesParam = (key) => requestedParamKeys.has(key) || acpParamKeys.has(key);
+  const slugUsesParam = (key: string) => requestedParamKeys.has(key) || acpParamKeys.has(key);
   if (options.reasoningEffort && (slugUsesParam("reasoning") || slugUsesParam("effort"))) {
     const parameterKey = cursorAcpParameterKeyForModel(baseModel, options);
     params[parameterKey] =
@@ -899,13 +973,13 @@ function buildCursorParameterizedModelFromOptions({ acpModelValue, options, choi
   return buildCursorParameterizedModelSlug(baseModel, params);
 }
 
-export function resolveCursorAcpBaseModelId(model) {
+export function resolveCursorAcpBaseModelId(model: unknown): string {
   const trimmed = String(model || "").trim();
   if (!trimmed || trimmed === "auto") return "auto";
   return stripCursorParameterizedSuffix(trimmed) || "auto";
 }
 
-function resolveCursorAutoModelValue(choices) {
+function resolveCursorAutoModelValue(choices: CursorModelChoice[]): string | undefined {
   return (
     choices.find((choice) => choice.slug.trim().toLowerCase() === "auto")?.slug ||
     choices.find((choice) => choice.slug.trim().toLowerCase() === "default")?.slug ||
@@ -913,7 +987,7 @@ function resolveCursorAutoModelValue(choices) {
   );
 }
 
-function cursorModelParametersEqualExceptFast(left, right) {
+function cursorModelParametersEqualExceptFast(left: unknown, right: unknown): boolean {
   const leftParams = cursorModelParametersToObject(left);
   const rightParams = cursorModelParametersToObject(right);
   delete leftParams.fast;
@@ -921,7 +995,7 @@ function cursorModelParametersEqualExceptFast(left, right) {
   return JSON.stringify(leftParams) === JSON.stringify(rightParams);
 }
 
-function findCursorModelChoiceIgnoringFast(choices, model) {
+function findCursorModelChoiceIgnoringFast(choices: CursorModelChoice[], model: string): string | undefined {
   const requestedParams = parseCursorModelParameters(model);
   if (requestedParams.get("fast") !== "true") return undefined;
   const baseModel = stripCursorParameterizedSuffix(model);
@@ -933,7 +1007,7 @@ function findCursorModelChoiceIgnoringFast(choices, model) {
   )?.slug;
 }
 
-function cursorModelChoiceSupportsRequestedParameters(choice, requested) {
+function cursorModelChoiceSupportsRequestedParameters(choice: string, requested: string): boolean {
   if (stripCursorParameterizedSuffix(choice) !== stripCursorParameterizedSuffix(requested)) return false;
   const choiceParams = parseCursorModelParameters(choice);
   const requestedParams = parseCursorModelParameters(requested);
@@ -946,11 +1020,15 @@ function cursorModelChoiceSupportsRequestedParameters(choice, requested) {
   return true;
 }
 
-function findCursorModelChoiceWithSupportedParameters(choices, model) {
+function findCursorModelChoiceWithSupportedParameters(choices: CursorModelChoice[], model: string): string | undefined {
   return choices.find((choice) => cursorModelChoiceSupportsRequestedParameters(choice.slug, model))?.slug;
 }
 
-function cursorCliStyleOptionsMatch(choice, requestedBaseModel, requestedOptions) {
+function cursorCliStyleOptionsMatch(
+  choice: CursorModelChoice,
+  requestedBaseModel: string,
+  requestedOptions: CursorModelOptions | undefined,
+): boolean {
   if (String(choice?.slug || "").includes("[")) return false;
   const choiceBase = normalizeCursorModelVariantBaseId(choice.slug);
   const requestedBase = normalizeCursorCliBaseModelId(requestedBaseModel);
@@ -974,11 +1052,19 @@ function cursorCliStyleOptionsMatch(choice, requestedBaseModel, requestedOptions
   return true;
 }
 
-function findCursorCliStyleVariantChoice(choices, baseModel, options) {
+function findCursorCliStyleVariantChoice(
+  choices: CursorModelChoice[],
+  baseModel: string,
+  options: CursorModelOptions | undefined,
+): string | undefined {
   return choices.find((choice) => cursorCliStyleOptionsMatch(choice, baseModel, options))?.slug;
 }
 
-export function resolveCursorAcpModelValue(configOptions, model, options) {
+export function resolveCursorAcpModelValue(
+  configOptions: unknown,
+  model: unknown,
+  options?: CursorModelOptions | null,
+): string | undefined {
   const trimmed = String(model || "").trim();
   if (!trimmed) return undefined;
   const choices = flattenCursorAcpModelChoices(Array.isArray(configOptions) ? configOptions : []);
@@ -1000,8 +1086,8 @@ export function resolveCursorAcpModelValue(configOptions, model, options) {
   const inferredOptions = mergeCursorModelOptions(
     cursorModelOptionsFromModelParameters(trimmed),
     cursorModelOptionsFromCliModelId(trimmed),
-    options,
-  );
+    options ?? undefined,
+  ) ?? {};
   const cliStyleVariant = findCursorCliStyleVariantChoice(choices, baseModel, inferredOptions);
   if (cliStyleVariant) return cliStyleVariant;
 
@@ -1039,7 +1125,8 @@ export function resolveCursorAcpModelValue(configOptions, model, options) {
   return acpModelValue.includes("[") ? resolvedModel : acpModelValue;
 }
 
-export function modelSupportsAcpReasoningConfig(configOptions, modelValue) {
+export function modelSupportsAcpReasoningConfig(configOptions: unknown, modelValue: unknown): boolean {
+  const options = Array.isArray(configOptions) ? (configOptions as CursorConfigOption[]) : [];
   const baseModel = stripCursorParameterizedSuffix(String(modelValue || "").trim());
   if (!baseModel || baseModel === "auto") return false;
   if (/^composer(?:[-[]|$)/u.test(baseModel)) return false;
@@ -1051,10 +1138,10 @@ export function modelSupportsAcpReasoningConfig(configOptions, modelValue) {
     return params.has("reasoning") || params.has("effort");
   });
   if (reasoningInChoices) return true;
-  return Boolean(findConfigOption(configOptions, ["effort", "reasoning", "thought level"]));
+  return Boolean(findConfigOption(options, ["effort", "reasoning", "thought level"]));
 }
 
-export function validateCursorAcpModelValue(configOptions, modelValue) {
+export function validateCursorAcpModelValue(configOptions: unknown, modelValue: unknown): string | null {
   const trimmed = String(modelValue || "").trim();
   if (!trimmed) return null;
   const choices = flattenCursorAcpModelChoices(Array.isArray(configOptions) ? configOptions : []);
@@ -1078,7 +1165,12 @@ export function validateCursorAcpModelValue(configOptions, modelValue) {
       const choiceParams = parseCursorModelParameters(choice.slug);
       return choiceParams.has("reasoning") || choiceParams.has("effort");
     });
-    const hasReasoningConfig = Boolean(findConfigOption(configOptions, ["effort", "reasoning", "thought level"]));
+    const hasReasoningConfig = Boolean(
+      findConfigOption(
+        Array.isArray(configOptions) ? (configOptions as CursorConfigOption[]) : [],
+        ["effort", "reasoning", "thought level"],
+      ),
+    );
     if (!reasoningInChoices && !hasReasoningConfig) {
       return `Invalid params: Invalid model value: ${trimmed}`;
     }
@@ -1087,7 +1179,7 @@ export function validateCursorAcpModelValue(configOptions, modelValue) {
   return null;
 }
 
-function toConfigValue(option, value) {
+function toConfigValue(option: CursorConfigOption, value: unknown): unknown {
   if (option.type === "boolean") {
     return typeof value === "boolean" ? value : String(value).trim().toLowerCase() === "true";
   }
@@ -1105,7 +1197,7 @@ function toConfigValue(option, value) {
       typeof entry?.value === "string"
         ? [{ value: entry.value, name: entry.name }]
         : Array.isArray(entry?.options)
-          ? entry.options.map((nested) => ({ value: nested.value, name: nested.name }))
+          ? entry.options.map((nested: CursorSelectOptionEntry) => ({ value: nested.value, name: nested.name }))
           : [];
     for (const candidate of candidates) {
       if (
@@ -1119,17 +1211,21 @@ function toConfigValue(option, value) {
   return undefined;
 }
 
-export function collectCursorAcpConfigUpdates(configOptions, options, modelValue) {
+export function collectCursorAcpConfigUpdates(
+  configOptions: unknown,
+  options: CursorModelOptions | undefined,
+  modelValue: unknown,
+): Array<{ configId: string; value: unknown }> {
   if (!options) return [];
-  const source = Array.isArray(configOptions) ? configOptions : [];
-  const updates = [];
-  const pushUpdate = (aliases, value) => {
+  const source = Array.isArray(configOptions) ? (configOptions as CursorConfigOption[]) : [];
+  const updates: Array<{ configId: string; value: unknown }> = [];
+  const pushUpdate = (aliases: string[], value: unknown) => {
     if (value === undefined) return;
     const option = findConfigOption(source, aliases);
     if (!option) return;
     const configValue = toConfigValue(option, value);
     if (configValue === undefined) return;
-    updates.push({ configId: option.id, value: configValue });
+    updates.push({ configId: option.id ?? "model", value: configValue });
   };
 
   if (modelSupportsAcpReasoningConfig(source, modelValue)) {
@@ -1141,6 +1237,6 @@ export function collectCursorAcpConfigUpdates(configOptions, options, modelValue
   return updates;
 }
 
-export function modelConfigId(configOptions) {
-  return findModelConfig(Array.isArray(configOptions) ? configOptions : [])?.id || "model";
+export function modelConfigId(configOptions: unknown): string {
+  return findModelConfig(Array.isArray(configOptions) ? (configOptions as CursorConfigOption[]) : [])?.id || "model";
 }

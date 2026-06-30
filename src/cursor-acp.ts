@@ -1,4 +1,4 @@
-// @ts-nocheck
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -7,6 +7,22 @@ import {
   createCursorAcpEventProcessor,
   mergeCursorAcpToolCallState,
 } from "./cursor-acp-event-processor";
+import type { CursorModelEntry, CursorModelOptions } from "./types/cursor";
+import type {
+  AcpProcessorEvent,
+  CursorAcpClientOptions,
+  CursorAcpEventProcessor,
+  CursorAcpPendingRequest,
+  CursorAcpPooledSession,
+  CursorAcpRuntimeOptions,
+  JsonRpcError,
+  JsonRpcErrorPayload,
+  CursorAcpSessionSetup,
+  CursorAcpPromptResult,
+  CursorAcpAvailableModelsResult,
+  CursorAcpConfigOptionResult,
+} from "./types/acp";
+import { isRecord } from "./lib/record";
 
 import {
   collectCursorAcpConfigUpdates,
@@ -27,42 +43,57 @@ export { deriveToolActivityPresentation } from "./tool-activity";
 const packageInfo = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const clientInfo = { name: "sub-bridge", version: String(packageInfo.version || "0.0.0") };
 
-function isRecord(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
+function asSessionSetup(value: unknown): CursorAcpSessionSetup {
+  return isRecord(value) ? (value as CursorAcpSessionSetup) : {};
 }
 
-function textFromContent(content) {
+function asPromptResult(value: unknown): CursorAcpPromptResult {
+  return isRecord(value) ? (value as CursorAcpPromptResult) : {};
+}
+
+function asAvailableModels(value: unknown): CursorAcpAvailableModelsResult {
+  return isRecord(value) ? (value as CursorAcpAvailableModelsResult) : {};
+}
+
+function asConfigOptionResult(value: unknown): CursorAcpConfigOptionResult {
+  return isRecord(value) ? (value as CursorAcpConfigOptionResult) : {};
+}
+
+function textFromContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
-  const parts = [];
+  const parts: string[] = [];
   for (const item of content) {
+    const entry = item as Record<string, unknown>;
     if (typeof item === "string") {
       parts.push(item);
-    } else if (item?.type === "input_text" || item?.type === "output_text" || item?.type === "text") {
-      if (typeof item.text === "string") parts.push(item.text);
-    } else if (item?.type === "refusal" && typeof item.refusal === "string") {
-      parts.push(item.refusal);
+    } else if (entry?.type === "input_text" || entry?.type === "output_text" || entry?.type === "text") {
+      if (typeof entry.text === "string") parts.push(entry.text);
+    } else if (entry?.type === "refusal" && typeof entry.refusal === "string") {
+      parts.push(entry.refusal);
     }
   }
   return parts.join("");
 }
 
-function imageFromPart(part) {
-  if (!part || part.type !== "input_image") return null;
-  const imageUrl = part.image_url?.url || part.image_url;
+function imageFromPart(part: unknown): { type: "image"; mimeType: string; data: string } | null {
+  const record = isRecord(part) ? part : null;
+  if (!record || record.type !== "input_image") return null;
+  const imageUrlRecord = isRecord(record.image_url) ? record.image_url : null;
+  const imageUrl = imageUrlRecord?.url ?? record.image_url;
   if (typeof imageUrl !== "string") return null;
   const match = /^data:([^;,]+);base64,(.+)$/i.exec(imageUrl);
   if (!match) return null;
   return { type: "image", mimeType: match[1], data: match[2] };
 }
 
-function appendContentBlocks(content, textParts, imageParts) {
+function appendContentBlocks(content: unknown, textParts: string[], imageParts: Array<{ type: "image"; mimeType: string; data: string }>): void {
   if (typeof content === "string") {
     if (content.trim()) textParts.push(content.trim());
     return;
   }
   if (!Array.isArray(content)) return;
-  const localText = [];
+  const localText: string[] = [];
   for (const item of content) {
     if (typeof item === "string") {
       localText.push(item);
@@ -71,7 +102,7 @@ function appendContentBlocks(content, textParts, imageParts) {
     const image = imageFromPart(item);
     if (image) {
       imageParts.push(image);
-    } else if (item?.type === "input_text" || item?.type === "text" || item?.type === "output_text") {
+    } else if (isRecord(item) && (item.type === "input_text" || item.type === "text" || item.type === "output_text")) {
       if (typeof item.text === "string") localText.push(item.text);
     }
   }
@@ -79,8 +110,9 @@ function appendContentBlocks(content, textParts, imageParts) {
   if (text) textParts.push(text);
 }
 
-function copilotToolDefinition(tool) {
-  const source = tool?.function && typeof tool.function === "object" ? tool.function : tool;
+function copilotToolDefinition(tool: unknown): string | null {
+  const toolRecord = isRecord(tool) ? tool : null;
+  const source = isRecord(toolRecord?.function) ? toolRecord.function : toolRecord;
   const name = typeof source?.name === "string" ? source.name.trim() : "";
   if (!name || name.startsWith("subbridge_cursor_")) return null;
   const description =
@@ -92,21 +124,21 @@ function copilotToolDefinition(tool) {
   return params ? `- ${name}${params}` : `- ${name}`;
 }
 
-function summarizeCopilotToolParameters(parameters) {
-  if (!parameters || typeof parameters !== "object") return "";
+function summarizeCopilotToolParameters(parameters: unknown): string {
+  if (!isRecord(parameters)) return "";
   const required = Array.isArray(parameters.required) ? parameters.required : [];
-  const properties =
-    parameters.properties && typeof parameters.properties === "object" ? parameters.properties : {};
+  const properties = isRecord(parameters.properties) ? parameters.properties : {};
   const chunks = required.map((key) => {
-    const schema = properties[key];
+    const schemaValue = properties[String(key)];
+    const schema = isRecord(schemaValue) ? schemaValue : undefined;
     const type = typeof schema?.type === "string" ? schema.type : "value";
     return `${key}:${type}`;
   });
   return chunks.length > 0 ? ` (requires ${chunks.join(", ")})` : "";
 }
 
-function appendCopilotToolsToPrompt(body, textParts) {
-  const lines = [];
+function appendCopilotToolsToPrompt(body: Record<string, unknown>, textParts: string[]): void {
+  const lines: string[] = [];
   for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
     const line = copilotToolDefinition(tool);
     if (line) lines.push(line);
@@ -123,9 +155,9 @@ function appendCopilotToolsToPrompt(body, textParts) {
   );
 }
 
-export function responsesBodyToCursorPrompt(body) {
-  const textParts = [];
-  const imageParts = [];
+export function responsesBodyToCursorPrompt(body: Record<string, unknown>): Array<{ type: string; text?: string; mimeType?: string; data?: string }> {
+  const textParts: string[] = [];
+  const imageParts: Array<{ type: "image"; mimeType: string; data: string }> = [];
 
   if (typeof body.instructions === "string" && body.instructions.trim()) {
     textParts.push(`Instructions:\n${body.instructions.trim()}`);
@@ -168,25 +200,25 @@ export function responsesBodyToCursorPrompt(body) {
       continue;
     }
 
-    const localText = [];
+    const localText: string[] = [];
     appendContentBlocks(item.content, localText, imageParts);
     const text = localText.join("\n").trim();
     if (text) textParts.push(`${role}:\n${text}`);
   }
 
-  const prompt = [];
+  const prompt: Array<{ type: string; text?: string; mimeType?: string; data?: string }> = [];
   const text = textParts.join("\n\n").trim() || "Continue.";
   prompt.push({ type: "text", text });
   prompt.push(...imageParts);
   return prompt;
 }
 
-function trimNonEmpty(value) {
+function trimNonEmpty(value: unknown): string | undefined {
   const trimmed = typeof value === "string" ? value.trim() : "";
   return trimmed || undefined;
 }
 
-function usageFromAcpUsage(usage) {
+function usageFromAcpUsage(usage: unknown): Record<string, unknown> | null {
   if (!isRecord(usage)) return null;
   const inputTokens = Number(usage.inputTokens ?? usage.input_tokens ?? 0) || 0;
   const outputTokens = Number(usage.outputTokens ?? usage.output_tokens ?? 0) || 0;
@@ -202,19 +234,26 @@ function usageFromAcpUsage(usage) {
   };
 }
 
-function errorFromJsonRpc(error) {
-  const details = [];
+function errorFromJsonRpc(error: JsonRpcErrorPayload | undefined): JsonRpcError {
+  const details: string[] = [];
   if (typeof error?.message === "string" && error.message) details.push(error.message);
   if (typeof error?.data?.message === "string" && error.data.message) details.push(error.data.message);
   const message = details.length > 0 ? details.join(": ") : JSON.stringify(error);
-  const result = new Error(message);
+  const result = new Error(message) as JsonRpcError;
   result.code = error?.code;
   result.data = error?.data;
   return result;
 }
 
 export class CursorAcpClient {
-  constructor(options) {
+  options: CursorAcpClientOptions;
+  nextId: number;
+  pending: Map<number, CursorAcpPendingRequest>;
+  buffer: string;
+  closed: boolean;
+  child: ChildProcessWithoutNullStreams | null;
+
+  constructor(options: CursorAcpClientOptions) {
     this.options = options;
     this.nextId = 1;
     this.pending = new Map();
@@ -246,7 +285,7 @@ export class CursorAcpClient {
     });
   }
 
-  handleStdout(chunk) {
+  handleStdout(chunk: string): void {
     this.buffer += chunk;
     while (true) {
       const index = this.buffer.indexOf("\n");
@@ -265,7 +304,7 @@ export class CursorAcpClient {
     }
   }
 
-  deliverProcessorEvents(message) {
+  deliverProcessorEvents(message: unknown): void {
     const processor = this.options.eventProcessor;
     if (!processor) return;
     const delivered = processor.deliveredCount ?? 0;
@@ -274,24 +313,25 @@ export class CursorAcpClient {
       const event = all[index];
       this.options.onEvent?.(event, message);
       if (event.type === "content_delta" && event.streamKind === "assistant_text") {
-        this.options.onDelta?.(event.text, message);
+        this.options.onDelta?.(String(event.text ?? ""), message);
       }
     }
     processor.deliveredCount = all.length;
   }
 
-  handleMessage(message) {
+  handleMessage(message: Record<string, unknown>): void {
     if (message && Object.prototype.hasOwnProperty.call(message, "id") && message.method) {
       this.handleServerRequest(message);
       return;
     }
     if (message && Object.prototype.hasOwnProperty.call(message, "id")) {
-      const pending = this.pending.get(message.id);
+      const requestId = Number(message.id);
+      const pending = this.pending.get(requestId);
       if (!pending) return;
       clearTimeout(pending.timer);
-      this.pending.delete(message.id);
+      this.pending.delete(requestId);
       if (message.error) {
-        pending.reject(errorFromJsonRpc(message.error));
+        pending.reject(errorFromJsonRpc(message.error as JsonRpcErrorPayload));
       } else {
         pending.resolve(message.result);
       }
@@ -307,47 +347,46 @@ export class CursorAcpClient {
     }
   }
 
-  handleServerRequest(message) {
-    const params = message.params || {};
+  handleServerRequest(message: Record<string, unknown>): void {
+    const params = (isRecord(message.params) ? message.params : {}) as Record<string, unknown>;
     if (message.method === "session/request_permission") {
       const options = Array.isArray(params.options) ? params.options : [];
-      const selected =
-        options.find((option) => option.kind === "allow_always") ||
-        options.find((option) => option.kind === "allow_once") ||
-        options[0];
+      const selected = (options as Array<Record<string, unknown>>).find((option) => option.kind === "allow_always") ||
+        (options as Array<Record<string, unknown>>).find((option) => option.kind === "allow_once") ||
+        (options as Array<Record<string, unknown>>)[0];
       if (selected?.optionId) {
-        this.respond(message.id, { outcome: { outcome: "selected", optionId: selected.optionId } });
+        this.respond(message.id as number, { outcome: { outcome: "selected", optionId: selected.optionId } });
       } else {
-        this.respond(message.id, { outcome: { outcome: "cancelled" } });
+        this.respond(message.id as number, { outcome: { outcome: "cancelled" } });
       }
       return;
     }
     const processor = this.options.eventProcessor;
     if (processor) {
-      const result = processor.ingestExtensionRequest(message.method, params);
+      const result = processor.ingestExtensionRequest(String(message.method), params);
       if (result !== undefined) {
         this.deliverProcessorEvents(message);
-        this.respond(message.id, result);
+        this.respond(message.id as number, result);
         return;
       }
     }
-    this.respondError(message.id, -32601, `Method not found: ${message.method}`);
+    this.respondError(message.id as number, -32601, `Method not found: ${String(message.method)}`);
   }
 
-  respond(id, result) {
+  respond(id: number, result: unknown): void {
     this.write({ jsonrpc: "2.0", id, result });
   }
 
-  respondError(id, code, message) {
+  respondError(id: number, code: number, message: string): void {
     this.write({ jsonrpc: "2.0", id, error: { code, message } });
   }
 
-  request(method, params) {
+  request(method: string, params: unknown): Promise<unknown> {
     if (this.closed || !this.child?.stdin.writable) {
       return Promise.reject(new Error("Cursor ACP process is closed"));
     }
     const id = this.nextId++;
-    const timeoutMs = this.options.timeoutMs;
+    const timeoutMs = this.options.timeoutMs ?? 600_000;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -358,11 +397,12 @@ export class CursorAcpClient {
     });
   }
 
-  write(message) {
+  write(message: Record<string, unknown>): void {
+    if (!this.child?.stdin) return;
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  rejectAll(error) {
+  rejectAll(error: Error): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
@@ -370,7 +410,7 @@ export class CursorAcpClient {
     this.pending.clear();
   }
 
-  cancelPending(error) {
+  cancelPending(error: unknown): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error instanceof Error ? error : new Error(String(error)));
@@ -391,7 +431,7 @@ export class CursorAcpClient {
   }
 }
 
-async function setConfigOption(client, sessionId, configId, value) {
+async function setConfigOption(client: CursorAcpClient, sessionId: string, configId: string, value: unknown) {
   const payload =
     typeof value === "boolean"
       ? { sessionId, configId, type: "boolean", value }
@@ -399,11 +439,16 @@ async function setConfigOption(client, sessionId, configId, value) {
   return client.request("session/set_config_option", payload);
 }
 
-export async function configureCursorSession(client, sessionId, sessionSetup, options) {
+export async function configureCursorSession(
+  client: CursorAcpClient,
+  sessionId: string,
+  sessionSetup: CursorAcpSessionSetup,
+  options: CursorAcpClientOptions,
+) {
   let configOptions = Array.isArray(sessionSetup?.configOptions) ? sessionSetup.configOptions : [];
   const requestedModel = options.model && options.model !== "default" ? options.model : "auto";
   const modelOptions = mergeCursorModelOptions(
-    options.modelOptions,
+    options.modelOptions as CursorModelOptions | undefined,
     options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : null,
   );
   const modelValue = resolveCursorAcpModelValue(configOptions, requestedModel, modelOptions);
@@ -415,19 +460,21 @@ export async function configureCursorSession(client, sessionId, sessionSetup, op
   }
   if (modelValue) {
     const result = await setConfigOption(client, sessionId, modelConfigId(configOptions), modelValue);
-    if (Array.isArray(result?.configOptions)) configOptions = result.configOptions;
+    const configResult = asConfigOptionResult(result);
+    if (Array.isArray(configResult.configOptions)) configOptions = configResult.configOptions;
   }
 
   for (const update of collectCursorAcpConfigUpdates(configOptions, acpModelOptions, modelValue)) {
     const result = await setConfigOption(client, sessionId, update.configId, update.value);
-    if (Array.isArray(result?.configOptions)) configOptions = result.configOptions;
+    const configResult = asConfigOptionResult(result);
+    if (Array.isArray(configResult.configOptions)) configOptions = configResult.configOptions;
   }
   return configOptions;
 }
 
-async function runCursorAcpTurnEphemeral(options) {
-  const textChunks = [];
-  const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set();
+async function runCursorAcpTurnEphemeral(options: CursorAcpClientOptions) {
+  const textChunks: string[] = [];
+  const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set<string>();
   const eventProcessor = createCursorAcpEventProcessor({ copilotToolNames });
   eventProcessor.deliveredCount = 0;
   const client = new CursorAcpClient({
@@ -460,17 +507,17 @@ async function runCursorAcpTurnEphemeral(options) {
       clientInfo,
     });
     await client.request("authenticate", { methodId: "cursor_login" });
-    const sessionSetup = await client.request("session/new", {
+    const sessionSetup = asSessionSetup(await client.request("session/new", {
       cwd: options.workspace,
       mcpServers: [],
-    });
-    const sessionId = sessionSetup?.sessionId;
+    }));
+    const sessionId = sessionSetup.sessionId;
     if (typeof sessionId !== "string" || !sessionId) {
       throw new Error("Cursor ACP did not return a sessionId");
     }
     await configureCursorSession(client, sessionId, sessionSetup, options);
-    const prompt = responsesBodyToCursorPrompt(options.body);
-    const promptResult = await client.request("session/prompt", { sessionId, prompt });
+    const prompt = responsesBodyToCursorPrompt((options.body ?? {}) as Record<string, unknown>);
+    const promptResult = asPromptResult(await client.request("session/prompt", { sessionId, prompt }));
     eventProcessor.flush();
     const events = eventProcessor.snapshot();
     const outputText = textChunks.join("");
@@ -479,8 +526,8 @@ async function runCursorAcpTurnEphemeral(options) {
       promptResult,
       initializeResult,
       events,
-      usage: usageFromAcpUsage(promptResult?.usage),
-      stopReason: promptResult?.stopReason || "completed",
+      usage: usageFromAcpUsage(promptResult.usage),
+      stopReason: promptResult.stopReason || "completed",
     };
   } finally {
     if (signal) signal.removeEventListener("abort", abort);
@@ -488,14 +535,14 @@ async function runCursorAcpTurnEphemeral(options) {
   }
 }
 
-export async function runCursorAcpTurn(options) {
+export async function runCursorAcpTurn(options: CursorAcpClientOptions) {
   if (cursorAcpPoolEnabled()) {
     return getCursorAcpRuntime(options).runTurn(options);
   }
   return runCursorAcpTurnEphemeral(options);
 }
 
-export async function fetchCursorAcpModels(options) {
+export async function fetchCursorAcpModels(options: CursorAcpClientOptions): Promise<CursorModelEntry[]> {
   if (cursorAcpPoolEnabled()) {
     return getCursorAcpRuntime(options).fetchModels(options);
   }
@@ -512,18 +559,18 @@ export async function fetchCursorAcpModels(options) {
       clientInfo,
     });
     await client.request("authenticate", { methodId: "cursor_login" });
-    const sessionSetup = await client.request("session/new", {
+    const sessionSetup = asSessionSetup(await client.request("session/new", {
       cwd: options.workspace,
       mcpServers: [],
-    });
-    const sessionId = sessionSetup?.sessionId;
+    }));
+    const sessionId = sessionSetup.sessionId;
     if (typeof sessionId === "string" && sessionId) {
       try {
-        const available = await client.request(CURSOR_LIST_AVAILABLE_MODELS_METHOD, { sessionId });
-        const models = cursorModelsFromAvailableModels(available?.models);
+        const available = asAvailableModels(await client.request(CURSOR_LIST_AVAILABLE_MODELS_METHOD, { sessionId }));
+        const models = cursorModelsFromAvailableModels(available.models);
         if (models.length > 0) return models;
       } catch (error) {
-        options.onProtocolError?.(error);
+        options.onProtocolError?.(error instanceof Error ? error : new Error(String(error)));
       }
     }
     return cursorModelsFromConfigOptions(sessionSetup?.configOptions);
@@ -532,7 +579,15 @@ export async function fetchCursorAcpModels(options) {
   }
 }
 
-export function cursorAbout({ command, env, timeoutMs = 8000 }) {
+export function cursorAbout({
+  command,
+  env,
+  timeoutMs = 8000,
+}: {
+  command: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+}) {
   const jsonResult = spawnSync(command, ["about", "--format", "json"], {
     env,
     encoding: "utf8",
@@ -581,14 +636,22 @@ function cursorAcpSessionPoolSize() {
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 4) : 1;
 }
 
-function cursorAcpRuntimeKey(options) {
+function cursorAcpRuntimeKey(options: CursorAcpRuntimeOptions): string {
   return [options.command, options.workspace, options.apiEndpoint || ""].join("\0");
 }
 
-const cursorAcpRuntimes = new Map();
+const cursorAcpRuntimes = new Map<string, CursorAcpRuntime>();
 
 class CursorAcpRuntime {
-  constructor(options) {
+  baseOptions: CursorAcpRuntimeOptions;
+  client: CursorAcpClient | null;
+  connectPromise: Promise<CursorAcpClient> | null;
+  opQueue: Promise<unknown>;
+  configOptions: unknown[] | null;
+  idleSessions: CursorAcpPooledSession[];
+  refillScheduled: boolean;
+
+  constructor(options: CursorAcpRuntimeOptions) {
     this.baseOptions = {
       command: options.command,
       workspace: options.workspace,
@@ -604,7 +667,7 @@ class CursorAcpRuntime {
     this.refillScheduled = false;
   }
 
-  enqueue(task) {
+  enqueue<T>(task: () => Promise<T>): Promise<T> {
     const run = this.opQueue.then(() => task(), () => task());
     this.opQueue = run.catch(() => {});
     return run;
@@ -651,12 +714,14 @@ class CursorAcpRuntime {
     }
   }
 
-  async _createSession() {
+  async _createSession(): Promise<CursorAcpSessionSetup> {
     const client = await this.ensureConnected();
-    return client.request("session/new", {
-      cwd: this.baseOptions.workspace,
-      mcpServers: [],
-    });
+    return asSessionSetup(
+      await client.request("session/new", {
+        cwd: this.baseOptions.workspace,
+        mcpServers: [],
+      }),
+    );
   }
 
   _scheduleSessionRefill() {
@@ -701,11 +766,11 @@ class CursorAcpRuntime {
     return { sessionId, configOptions };
   }
 
-  _validateTurnOptions(options) {
+  async _validateTurnOptions(options: CursorAcpClientOptions) {
     const configOptions = this.configOptions || [];
     const requestedModel = options.model && options.model !== "default" ? options.model : "auto";
     const modelOptions = mergeCursorModelOptions(
-      options.modelOptions,
+      options.modelOptions as CursorModelOptions | undefined,
       options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : null,
     );
     const modelValue = resolveCursorAcpModelValue(configOptions, requestedModel, modelOptions);
@@ -714,10 +779,10 @@ class CursorAcpRuntime {
     return { requestedModel, modelOptions, modelValue };
   }
 
-  async runTurn(options) {
+  async runTurn(options: CursorAcpClientOptions) {
     return this.enqueue(async () => {
-      const textChunks = [];
-      const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set();
+      const textChunks: string[] = [];
+      const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set<string>();
       const eventProcessor = createCursorAcpEventProcessor({ copilotToolNames });
       eventProcessor.deliveredCount = 0;
       const client = await this.ensureConnected();
@@ -754,8 +819,8 @@ class CursorAcpRuntime {
         this._validateTurnOptions(options);
         const { sessionId, configOptions } = await this._acquireSession();
         await configureCursorSession(client, sessionId, { configOptions }, options);
-        const prompt = responsesBodyToCursorPrompt(options.body);
-        const promptResult = await client.request("session/prompt", { sessionId, prompt });
+        const prompt = responsesBodyToCursorPrompt((options.body ?? {}) as Record<string, unknown>);
+        const promptResult = asPromptResult(await client.request("session/prompt", { sessionId, prompt }));
         eventProcessor.flush();
         return {
           text: textChunks.join(""),
@@ -766,7 +831,7 @@ class CursorAcpRuntime {
           stopReason: promptResult?.stopReason || "completed",
         };
       } catch (error) {
-        if (client.closed || String(error?.message || "").includes("Cursor ACP exited")) {
+        if (client.closed || String((error as Error)?.message || "").includes("Cursor ACP exited")) {
           this.client = null;
           this.configOptions = null;
           this.idleSessions = [];
@@ -783,7 +848,7 @@ class CursorAcpRuntime {
     });
   }
 
-  async fetchModels(options) {
+  async fetchModels(options: CursorAcpClientOptions): Promise<CursorModelEntry[]> {
     return this.enqueue(async () => {
       const client = await this.ensureConnected();
       await this._primeConfigOptions();
@@ -791,11 +856,11 @@ class CursorAcpRuntime {
       const sessionId = pooled?.sessionId;
       if (typeof sessionId === "string" && sessionId) {
         try {
-          const available = await client.request(CURSOR_LIST_AVAILABLE_MODELS_METHOD, { sessionId });
-          const models = cursorModelsFromAvailableModels(available?.models);
+          const available = asAvailableModels(await client.request(CURSOR_LIST_AVAILABLE_MODELS_METHOD, { sessionId }));
+          const models = cursorModelsFromAvailableModels(available.models);
           if (models.length > 0) return models;
         } catch (error) {
-          options.onProtocolError?.(error);
+          options.onProtocolError?.(error instanceof Error ? error : new Error(String(error)));
         }
       }
       return cursorModelsFromConfigOptions(this.configOptions || []);
@@ -812,7 +877,7 @@ class CursorAcpRuntime {
   }
 }
 
-function getCursorAcpRuntime(options) {
+function getCursorAcpRuntime(options: CursorAcpRuntimeOptions): CursorAcpRuntime {
   const key = cursorAcpRuntimeKey(options);
   let runtime = cursorAcpRuntimes.get(key);
   if (!runtime) {

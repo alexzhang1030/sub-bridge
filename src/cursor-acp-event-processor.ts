@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   canonicalItemTypeFromAcpToolKind,
   deriveToolActivityPresentation,
@@ -14,21 +13,25 @@ import {
   summarizePlanSteps,
   summarizeQuestions,
 } from "./cursor-acp-extension";
+import { asRecord } from "./lib/record";
+import type { AcpProcessorEvent, CursorAcpEventProcessor } from "./types/acp";
 
-function isRecord(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function trimNonEmpty(value) {
+function trimNonEmpty(value: unknown): string | undefined {
   const trimmed = typeof value === "string" ? value.trim() : "";
   return trimmed || undefined;
 }
 
-function normalizeToolKind(kind) {
+function normalizeToolKind(kind: unknown): string | undefined {
   return typeof kind === "string" && kind.trim() ? kind.trim() : undefined;
 }
 
-function normalizeToolStatus(value, fallback = "in_progress") {
+type ToolStatus = "pending" | "in_progress" | "completed" | "failed";
+
+function normalizeToolStatus(value: unknown, fallback = "in_progress"): ToolStatus {
   switch (value) {
     case "pending":
       return "pending";
@@ -40,25 +43,26 @@ function normalizeToolStatus(value, fallback = "in_progress") {
     case "failed":
       return "failed";
     default:
-      return fallback;
+      return fallback as ToolStatus;
   }
 }
 
-function summarizeLocations(locations) {
+function summarizeLocations(locations: unknown): string {
   if (!Array.isArray(locations)) return "";
   const paths = locations
     .map((location) => {
-      if (!location || typeof location.path !== "string" || !location.path.trim()) return "";
-      return location.line === undefined || location.line === null
-        ? location.path.trim()
-        : `${location.path.trim()}:${location.line}`;
+      const record = asRecord(location);
+      if (!record || typeof record.path !== "string" || !record.path.trim()) return "";
+      return record.line === undefined || record.line === null
+        ? record.path.trim()
+        : `${record.path.trim()}:${record.line}`;
     })
     .filter(Boolean);
   if (paths.length === 0) return "";
   return paths.length === 1 ? paths[0] : `${paths[0]} +${paths.length - 1} more`;
 }
 
-function summarizeRawOutput(rawOutput) {
+function summarizeRawOutput(rawOutput: unknown): string {
   if (!isRecord(rawOutput)) return "";
   if (Number.isFinite(Number(rawOutput.totalFiles))) return `${Number(rawOutput.totalFiles)} files found`;
   if (typeof rawOutput.content === "string") {
@@ -69,12 +73,13 @@ function summarizeRawOutput(rawOutput) {
   return "";
 }
 
-function extractTextContentFromToolCallContent(content) {
+function extractTextContentFromToolCallContent(content: unknown): string | undefined {
   if (!Array.isArray(content)) return undefined;
-  const chunks = [];
+  const chunks: string[] = [];
   for (const entry of content) {
-    if (entry?.type !== "content") continue;
-    const nested = entry.content;
+    const entryRecord = asRecord(entry);
+    if (entryRecord?.type !== "content") continue;
+    const nested = asRecord(entryRecord.content);
     if (nested?.type !== "text" || typeof nested.text !== "string") continue;
     const text = nested.text.trim();
     if (text) chunks.push(text);
@@ -82,7 +87,7 @@ function extractTextContentFromToolCallContent(content) {
   return chunks.length > 0 ? chunks.join("\n") : undefined;
 }
 
-function inferToolKindFromTitle(title) {
+function inferToolKindFromTitle(title: unknown): string {
   const normalized = String(title || "").trim().toLowerCase();
   if (normalized === "find") return "search";
   if (normalized === "read" || normalized === "read file") return "read";
@@ -90,9 +95,23 @@ function inferToolKindFromTitle(title) {
   return "tool";
 }
 
-export function mergeCursorAcpToolCallState(previous, next) {
+export interface CursorAcpToolCallState {
+  id: string;
+  kind: string;
+  status: ToolStatus;
+  title: string;
+  command?: string;
+  detail?: string;
+  data: Record<string, unknown>;
+}
+
+export function mergeCursorAcpToolCallState(
+  previous: CursorAcpToolCallState | undefined,
+  next: CursorAcpToolCallState,
+): CursorAcpToolCallState {
   if (!previous) return next;
-  const nextKind = typeof next.data?.kind === "string" ? next.data.kind : next.kind;
+  const nextData = asRecord(next.data);
+  const nextKind = typeof nextData?.kind === "string" ? nextData.kind : next.kind;
   const kind = nextKind || previous.kind;
   return {
     ...previous,
@@ -110,45 +129,52 @@ export function mergeCursorAcpToolCallState(previous, next) {
   };
 }
 
-export function shouldEmitToolCallUpdate(previous, next) {
+export function shouldEmitToolCallUpdate(
+  previous: CursorAcpToolCallState | undefined,
+  next: CursorAcpToolCallState,
+): boolean {
   if (next.status === "completed" || next.status === "failed") return true;
   if (!next.detail) return false;
   return !previous || previous.title !== next.title || previous.detail !== next.detail;
 }
 
-export function makeCursorAcpToolCallState(update, { fallbackStatus } = {}) {
-  const toolCallId = trimNonEmpty(update.toolCallId);
+export function makeCursorAcpToolCallState(
+  update: unknown,
+  { fallbackStatus }: { fallbackStatus?: ToolStatus } = {},
+): CursorAcpToolCallState | null {
+  const record = asRecord(update);
+  const toolCallId = trimNonEmpty(record?.toolCallId);
   if (!toolCallId) return null;
 
-  const rawKind = normalizeToolKind(update.kind);
-  const kind = rawKind ?? inferToolKindFromTitle(update.title);
+  const rawKind = normalizeToolKind(record?.kind);
+  const kind = rawKind ?? inferToolKindFromTitle(record?.title);
   const status = normalizeToolStatus(
-    update.status,
-    fallbackStatus ?? (update.sessionUpdate === "tool_call" ? "pending" : "in_progress"),
+    record?.status,
+    fallbackStatus ?? (record?.sessionUpdate === "tool_call" ? "pending" : "in_progress"),
   );
-  const textContent = extractTextContentFromToolCallContent(update.content);
-  const locationDetail = summarizeLocations(update.locations);
-  const outputDetail = summarizeRawOutput(update.rawOutput);
+  const textContent = extractTextContentFromToolCallContent(record?.content);
+  const locationDetail = summarizeLocations(record?.locations);
+  const outputDetail = summarizeRawOutput(record?.rawOutput);
 
-  const data = {
+  const data: Record<string, unknown> = {
     toolCallId,
     kind,
-    ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
-    ...(update.rawOutput !== undefined ? { rawOutput: update.rawOutput } : {}),
-    ...(update.content !== undefined ? { content: update.content } : {}),
-    ...(update.locations !== undefined ? { locations: update.locations } : {}),
+    ...(record?.rawInput !== undefined ? { rawInput: record.rawInput } : {}),
+    ...(record?.rawOutput !== undefined ? { rawOutput: record.rawOutput } : {}),
+    ...(record?.content !== undefined ? { content: record.content } : {}),
+    ...(record?.locations !== undefined ? { locations: record.locations } : {}),
   };
 
-  const command = extractToolCommand(data, update.title);
+  const command = extractToolCommand(data, trimNonEmpty(record?.title));
   if (command) data.command = command;
 
-  const fallbackDetail = command ?? locationDetail ?? outputDetail ?? textContent ?? trimNonEmpty(update.title);
+  const fallbackDetail = command ?? locationDetail ?? outputDetail ?? textContent ?? trimNonEmpty(record?.title);
   const presentation = deriveToolActivityPresentation({
     itemType: canonicalItemTypeFromAcpToolKind(kind),
-    title: update.title,
+    title: trimNonEmpty(record?.title),
     detail: fallbackDetail,
     data,
-    fallbackSummary: trimNonEmpty(update.title) ?? "Tool",
+    fallbackSummary: trimNonEmpty(record?.title) ?? "Tool",
   });
 
   return {
@@ -162,13 +188,19 @@ export function makeCursorAcpToolCallState(update, { fallbackStatus } = {}) {
   };
 }
 
-export function createCursorAcpEventProcessor(options = {}) {
-  const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set();
-  const toolCallsById = new Map();
+export interface CursorAcpEventProcessorOptions {
+  copilotToolNames?: Set<string>;
+}
+
+export function createCursorAcpEventProcessor(
+  options: CursorAcpEventProcessorOptions = {},
+): CursorAcpEventProcessor {
+  const copilotToolNames = options.copilotToolNames instanceof Set ? options.copilotToolNames : new Set<string>();
+  const toolCallsById = new Map<string, CursorAcpToolCallState>();
   let assistantSegmentOpen = false;
   let lastPlanFingerprint = "";
 
-  const events = [];
+  const events: AcpProcessorEvent[] = [];
 
   const closeAssistantSegment = () => {
     if (!assistantSegmentOpen) return;
@@ -180,7 +212,7 @@ export function createCursorAcpEventProcessor(options = {}) {
     if (!assistantSegmentOpen) assistantSegmentOpen = true;
   };
 
-  const emitPlanUpdated = (payload) => {
+  const emitPlanUpdated = (payload: Record<string, unknown>) => {
     closeAssistantSegment();
     const fingerprint = JSON.stringify(payload);
     if (fingerprint === lastPlanFingerprint) return;
@@ -188,11 +220,12 @@ export function createCursorAcpEventProcessor(options = {}) {
     events.push({ type: "plan_updated", payload });
   };
 
-  const emitQuestionAsked = (payload) => {
+  const emitQuestionAsked = (payload: Record<string, unknown>) => {
     closeAssistantSegment();
     events.push({ type: "question_asked", payload });
     if (copilotToolNames.has("ask_user")) {
-      const askUserArgs = askUserArgumentsFromQuestions(payload.questions);
+      const questions = Array.isArray(payload.questions) ? payload.questions : [];
+      const askUserArgs = askUserArgumentsFromQuestions(questions as Parameters<typeof askUserArgumentsFromQuestions>[0]);
       if (askUserArgs) {
         events.push({
           type: "copilot_tool_call",
@@ -203,11 +236,12 @@ export function createCursorAcpEventProcessor(options = {}) {
     }
   };
 
-  const ingestSessionUpdate = (update) => {
-    if (!update || typeof update.sessionUpdate !== "string") return;
+  const ingestSessionUpdate = (update: unknown) => {
+    const record = asRecord(update);
+    if (!record || typeof record.sessionUpdate !== "string") return;
 
-    if (update.sessionUpdate === "plan") {
-      const steps = planStepsFromSessionUpdate(update);
+    if (record.sessionUpdate === "plan") {
+      const steps = planStepsFromSessionUpdate(record);
       if (steps.length === 0) return;
       emitPlanUpdated({
         title: "Plan updated",
@@ -219,23 +253,23 @@ export function createCursorAcpEventProcessor(options = {}) {
       return;
     }
 
-    if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
-      const content = update.content;
+    if (record.sessionUpdate === "agent_message_chunk" || record.sessionUpdate === "agent_thought_chunk") {
+      const content = asRecord(record.content);
       if (content?.type !== "text" || typeof content.text !== "string" || !content.text) return;
-      if (update.sessionUpdate === "agent_message_chunk") openAssistantSegment();
+      if (record.sessionUpdate === "agent_message_chunk") openAssistantSegment();
       events.push({
         type: "content_delta",
-        streamKind: update.sessionUpdate === "agent_thought_chunk" ? "reasoning_text" : "assistant_text",
-        ...(trimNonEmpty(update.messageId) ? { itemId: trimNonEmpty(update.messageId) } : {}),
+        streamKind: record.sessionUpdate === "agent_thought_chunk" ? "reasoning_text" : "assistant_text",
+        ...(trimNonEmpty(record.messageId) ? { itemId: trimNonEmpty(record.messageId) } : {}),
         text: content.text,
       });
       return;
     }
 
-    if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+    if (record.sessionUpdate === "tool_call" || record.sessionUpdate === "tool_call_update") {
       closeAssistantSegment();
-      const next = makeCursorAcpToolCallState(update, {
-        fallbackStatus: update.sessionUpdate === "tool_call" ? "pending" : "in_progress",
+      const next = makeCursorAcpToolCallState(record, {
+        fallbackStatus: record.sessionUpdate === "tool_call" ? "pending" : "in_progress",
       });
       if (!next) return;
 
@@ -253,32 +287,33 @@ export function createCursorAcpEventProcessor(options = {}) {
     }
   };
 
-  const ingestExtensionRequest = (method, params) => {
+  const ingestExtensionRequest = (method: string, params: unknown) => {
+    const record = asRecord(params);
     if (method === "cursor/create_plan") {
-      const steps = Array.isArray(params?.todos)
-        ? extractTodosAsPlan(params).steps
+      const steps = Array.isArray(record?.todos)
+        ? extractTodosAsPlan(record).steps
         : [];
       emitPlanUpdated({
-        title: trimNonEmpty(params?.name) ?? "Plan proposed",
+        title: trimNonEmpty(record?.name) ?? "Plan proposed",
         kind: "plan",
         source: method,
-        toolCallId: trimNonEmpty(params?.toolCallId),
-        planMarkdown: extractPlanMarkdown(params),
+        toolCallId: trimNonEmpty(record?.toolCallId),
+        planMarkdown: extractPlanMarkdown(record),
         steps,
-        detail: trimNonEmpty(params?.overview) ?? summarizePlanSteps(steps),
+        detail: trimNonEmpty(record?.overview) ?? summarizePlanSteps(steps),
         input: params,
       });
       return { accepted: true };
     }
 
     if (method === "cursor/update_todos") {
-      const { steps } = extractTodosAsPlan(params);
+      const { steps } = extractTodosAsPlan(record);
       if (steps.length === 0) return { ok: true };
       emitPlanUpdated({
         title: "Todos updated",
         kind: "plan",
         source: method,
-        toolCallId: trimNonEmpty(params?.toolCallId),
+        toolCallId: trimNonEmpty(record?.toolCallId),
         steps,
         detail: summarizePlanSteps(steps),
         input: params,
@@ -287,13 +322,13 @@ export function createCursorAcpEventProcessor(options = {}) {
     }
 
     if (method === "cursor/ask_question") {
-      const questions = extractAskQuestions(params);
+      const questions = extractAskQuestions(record);
       const answers = autoAnswersForQuestions(questions);
       emitQuestionAsked({
-        title: trimNonEmpty(params?.title) ?? "Cursor question",
+        title: trimNonEmpty(record?.title) ?? "Cursor question",
         kind: "question",
         source: method,
-        toolCallId: trimNonEmpty(params?.toolCallId),
+        toolCallId: trimNonEmpty(record?.toolCallId),
         questions,
         answers,
         detail: summarizeQuestions(questions, answers),
@@ -306,9 +341,11 @@ export function createCursorAcpEventProcessor(options = {}) {
     return undefined;
   };
 
-  const ingestMessage = (message) => {
-    if (message?.method !== "session/update") return;
-    ingestSessionUpdate(message.params?.update);
+  const ingestMessage = (message: unknown) => {
+    const record = asRecord(message);
+    if (record?.method !== "session/update") return;
+    const params = asRecord(record.params);
+    ingestSessionUpdate(params?.update);
   };
 
   const flush = () => {

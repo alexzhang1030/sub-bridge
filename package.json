@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
-    "check": "tsc --noEmit -p tsconfig.app.json && npm run build && node --check dist/cli.mjs",
+    "check": "tsc --noEmit && npm run build && node --check dist/cli.mjs",
     "ci": "npm run build && npm run check && bash -n install.sh && bash -n uninstall.sh && bash -n scripts/test-install.sh && npm test && npm run test:install && npm run smoke",
     "test:install": "bash scripts/test-install.sh",
     "test": "vitest run",

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { ensurePrivateDir } from "../lib/http";
 import { deleteSecret, resolveSecret, SecretName } from "../../secrets";
 
-type CursorEnvFactory = (options: { forceCi: boolean }) => Record<string, string>;
+type CursorEnvFactory = (options?: { forceCi?: boolean; baseEnv?: NodeJS.ProcessEnv; browserless?: boolean }) => NodeJS.ProcessEnv;
 
 export function loadCursorAuthToken(secretsDir: string, envKeys: string[]) {
   return resolveSecret(secretsDir, SecretName.CURSOR_AUTH_TOKEN, envKeys).value;
